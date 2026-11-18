@@ -11,6 +11,7 @@ from pill_bot.common import (ACTIVITY_RETENTION_SECONDS, HELP, SCHEMA, TIME_RE,
                              occurrence, parse_clock, parse_id, parse_name,
                              parse_times)
 from pill_bot.telegram import TelegramError, TelegramResponseError
+from pill_bot.privacy import EncryptionError
 
 LOG = logging.getLogger(__name__)
 
@@ -37,12 +38,16 @@ def main():
         db = connect(os.environ.get("PILL_DB", "pill_reminders.sqlite3"))
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    bot = ReminderBot(token, db, admin_id)
+    try:
+        bot = ReminderBot(token, db, admin_id)
+    except EncryptionError as exc:
+        db.close()
+        raise SystemExit(str(exc)) from None
     try:
         bot.bind_database()
         LOG.info("Multi-user reminder bot started.")
         bot.run()
-    except ValueError as exc:
+    except (ValueError, EncryptionError) as exc:
         raise SystemExit(str(exc)) from None
     except KeyboardInterrupt:
         LOG.info("Bot stopped.")

@@ -40,7 +40,7 @@ class MenuMixin:
             ).fetchall()
             if not rows:
                 return "No reminders. Use /add to create one."
-            return "\n".join(f"{r['id']}: {r['name']} — {r['clocks']} "
+            return "\n".join(f"{r['id']}: {self.privacy.decrypt(r['name'])} — {r['clocks']} "
                              f"({'enabled' if r['enabled'] else 'paused'})" for r in rows)
         if command == "/pending":
             return None
@@ -87,7 +87,7 @@ class MenuMixin:
         row = self.db.execute(
             "SELECT state, data FROM conversations WHERE user_id = ?", (user_id,)
         ).fetchone()
-        return (row["state"], json.loads(row["data"])) if row else (None, {})
+        return (row["state"], json.loads(self.privacy.decrypt(row["data"]))) if row else (None, {})
 
     def set_flow(self, user_id, state, data):
         if "token" not in data:
@@ -96,7 +96,7 @@ class MenuMixin:
             self.db.execute(
                 """INSERT INTO conversations VALUES (?, ?, ?)
                    ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, data = excluded.data""",
-                (user_id, state, json.dumps(data)),
+                (user_id, state, self.privacy.encrypt(json.dumps(data))),
             )
             self.db.execute("UPDATE users SET awaiting_timezone = 0 WHERE user_id = ?", (user_id,))
 
@@ -117,7 +117,7 @@ class MenuMixin:
             """SELECT id, name, enabled FROM reminders WHERE user_id = ?
                ORDER BY id LIMIT 9 OFFSET ?""", (user_id, page * 8)
         ).fetchall()
-        choices = [[(r["name"] + (" (paused)" if not r["enabled"] else ""),
+        choices = [[(self.privacy.decrypt(r["name"]) + (" (paused)" if not r["enabled"] else ""),
                      f"menu:med:{r['id']}")] for r in rows[:8]]
         navigation = []
         if page:
@@ -143,7 +143,7 @@ class MenuMixin:
             "SELECT clock FROM schedules WHERE reminder_id = ? ORDER BY clock", (reminder_id,)
         )]
         status = "active" if row["enabled"] else "paused"
-        self.present(f"{row['name']}\nTimes: {', '.join(clocks)}\nStatus: {status}", buttons(
+        self.present(f"{self.privacy.decrypt(row['name'])}\nTimes: {', '.join(clocks)}\nStatus: {status}", buttons(
             [("Change name", f"menu:rename:{reminder_id}"),
              ("Change times", f"menu:times:{reminder_id}")],
             [("Pause" if row["enabled"] else "Enable", f"menu:toggle:{reminder_id}")],
@@ -165,7 +165,8 @@ class MenuMixin:
                     self.menu(user_id, "Medication not found.")
                     return
                 with self.db:
-                    self.db.execute("UPDATE reminders SET name = ? WHERE id = ?", (name, reminder_id))
+                    self.db.execute("UPDATE reminders SET name = ? WHERE id = ?",
+                                    (self.privacy.encrypt(name), reminder_id))
                     self.db.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
                 self.log_activity(user_id, "edited a medication")
                 self.show_medication(user_id, reminder_id)
@@ -276,7 +277,7 @@ class MenuMixin:
                         self.clear_flow(user_id)
                         self.menu(user_id, "Medication not found.")
                     else:
-                        self.edit(user_id, data["id"], row["name"], sorted(data["times"]), now,
+                        self.edit(user_id, data["id"], self.privacy.decrypt(row["name"]), sorted(data["times"]), now,
                                   finish_flow=True)
                         self.show_medication(user_id, data["id"])
             else:
@@ -315,7 +316,7 @@ class MenuMixin:
                 self.set_enabled(user_id, reminder_id, not row["enabled"], now)
                 self.show_medication(user_id, reminder_id)
             elif operation == "remove":
-                self.present(f"Remove {row['name']} and all its pending doses?", buttons(
+                self.present(f"Remove {self.privacy.decrypt(row['name'])} and all its pending doses?", buttons(
                     [("Yes, remove", f"menu:delete:{reminder_id}")],
                     [("Keep it", f"menu:med:{reminder_id}")],
                 ), chat_id=user_id)

@@ -12,6 +12,7 @@ import requests
 from .activity import ActivityMixin
 from .common import HELP, buttons, parse_id
 from .menus import MenuMixin
+from .privacy import Privacy
 from .reminders import ReminderMixin
 from .telegram import TelegramError, TelegramMixin
 
@@ -22,6 +23,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
     def __init__(self, token, db, admin_id=None):
         self.token = token
         self.db = db
+        self.privacy = Privacy(os.environ.get("PILL_ENCRYPTION_KEY"))
         self.admin_id = admin_id
         self.menu_message = None
         self.log_timing = os.environ.get("PILL_LOG_TIMING") == "1"
@@ -79,7 +81,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
                             original = callback["message"].get("text")
                             if not isinstance(original, str) or not original:
                                 scheduled = datetime.fromtimestamp(dose["due"], zone)
-                                original = (f"Medication reminder: {dose['name']}\n"
+                                original = (f"Medication reminder: {self.privacy.decrypt(dose['name'])}\n"
                                             f"Scheduled: {scheduled:%Y-%m-%d %H:%M %Z}")
                             confirmation = f"{original}\nTaken: {taken:%Y-%m-%d %H:%M:%S %Z}"
                 else:

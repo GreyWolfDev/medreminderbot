@@ -13,9 +13,11 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import requests
+from cryptography.fernet import Fernet
 
 from pill_reminder import (ACTIVITY_RETENTION_SECONDS, ReminderBot, TelegramError,
                            TelegramResponseError, connect, occurrence, parse_clock, parse_times)
+from pill_bot.privacy import EncryptionError
 
 
 ZONE = ZoneInfo("Europe/London")
@@ -27,6 +29,10 @@ def stamp(year, month, day, hour, minute=0):
 
 class ReminderTests(unittest.TestCase):
     def setUp(self):
+        self.key = Fernet.generate_key().decode("ascii")
+        self.key_patch = patch.dict(os.environ, {"PILL_ENCRYPTION_KEY": self.key})
+        self.key_patch.start()
+        self.addCleanup(self.key_patch.stop)
         self.db = connect(":memory:")
         self.bot = ReminderBot("123:token", self.db)
         self.bot.bind_database()
@@ -44,6 +50,87 @@ class ReminderTests(unittest.TestCase):
 
     def doses(self):
         return self.db.execute("SELECT * FROM doses ORDER BY id").fetchall()
+
+    def test_encryption_migrates_existing_database_and_conversation(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "reminders.sqlite3"
+            db = connect(str(path))
+            db.execute("PRAGMA journal_mode=WAL")
+            with db:
+                db.execute("INSERT INTO settings VALUES ('user_timezones_migrated', '1')")
+                db.execute("INSERT INTO users (user_id, timezone) VALUES (42, 'Europe/London')")
+                db.execute("INSERT INTO reminders (user_id, name) VALUES (42, 'PrivateMigrationMedicine')")
+                db.execute("INSERT INTO schedules (reminder_id, clock, next_due) VALUES (1, '08:00', ?)",
+                           (stamp(2026, 1, 1, 8),))
+                db.execute("INSERT INTO doses (reminder_id, due, next_alert) VALUES (1, ?, ?)",
+                           (stamp(2026, 1, 1, 8), stamp(2026, 1, 1, 8)))
+                db.execute("INSERT INTO conversations VALUES (42, 'time_input', ?)",
+                           (json.dumps({"name": "PrivateFlowMedicine", "times": [], "mode": "add"}),))
+            bot = ReminderBot("123:token", db)
+            bot.bind_database()
+            self.assertIn("PrivateMigrationMedicine", bot.command(42, "/list", 0))
+            self.assertEqual(bot.flow(42)[1]["name"], "PrivateFlowMedicine")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM doses").fetchone()[0], 1)
+            for file in Path(directory).iterdir():
+                if file.is_file():
+                    content = file.read_bytes()
+                    self.assertNotIn(b"PrivateMigrationMedicine", content, file.name)
+                    self.assertNotIn(b"PrivateFlowMedicine", content, file.name)
+            bot.http.close()
+            db.close()
+            db = connect(str(path))
+            restarted = ReminderBot("123:token", db)
+            restarted.bind_database()
+            self.assertIn("PrivateMigrationMedicine", restarted.command(42, "/list", 0))
+            self.assertEqual(restarted.flow(42)[1]["name"], "PrivateFlowMedicine")
+            restarted.http.close()
+            db.close()
+
+    def test_encryption_new_data_wrong_key_and_corruption(self):
+        self.bot.add(42, "PrivateNewMedicine", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.set_flow(42, "time_input",
+                          {"name": "PrivateDraftMedicine", "times": [], "mode": "add"})
+        self.assertNotIn("PrivateNewMedicine", self.db.execute(
+            "SELECT name FROM reminders").fetchone()[0])
+        self.assertNotIn("PrivateDraftMedicine", self.db.execute(
+            "SELECT data FROM conversations").fetchone()[0])
+        with patch.dict(os.environ, {"PILL_ENCRYPTION_KEY": Fernet.generate_key().decode("ascii")}):
+            wrong = ReminderBot("123:token", self.db)
+            try:
+                with self.assertRaises(EncryptionError):
+                    wrong.bind_database()
+            finally:
+                wrong.http.close()
+        self.assertIn("PrivateNewMedicine", self.bot.command(42, "/list", 0))
+        with self.db:
+            self.db.execute("UPDATE reminders SET name = 'corrupt'")
+        with self.assertRaises(EncryptionError):
+            self.bot.command(42, "/list", 0)
+        with patch.dict(os.environ, {"PILL_ENCRYPTION_KEY": ""}):
+            with self.assertRaises(EncryptionError):
+                ReminderBot("123:token", self.db)
+
+    def test_encryption_interrupted_cleanup_resumes_on_restart(self):
+        with TemporaryDirectory() as directory:
+            path = str(Path(directory) / "reminders.sqlite3")
+            db = connect(path)
+            db.execute("INSERT INTO settings VALUES ('user_timezones_migrated', '1')")
+            db.execute("INSERT INTO reminders (user_id, name) VALUES (42, 'OldPrivateMedicine')")
+            db.commit()
+            bot = ReminderBot("123:token", db)
+            with patch.object(bot.privacy, "_checkpoint", side_effect=EncryptionError("busy")):
+                with self.assertRaises(EncryptionError):
+                    bot.bind_database()
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM settings WHERE key = 'encryption_cleanup_pending'").fetchone())
+            bot.bind_database()
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM settings WHERE key = 'encryption_cleanup_pending'").fetchone())
+            self.assertNotIn(b"OldPrivateMedicine", Path(path).read_bytes())
+            self.assertEqual(bot.privacy.decrypt(
+                db.execute("SELECT name FROM reminders").fetchone()[0]), "OldPrivateMedicine")
+            bot.http.close()
+            db.close()
 
     def test_symlinked_entry_point_loads_adjacent_package(self):
         source = Path(__file__).resolve().with_name("pill_reminder.py")
@@ -432,7 +519,7 @@ class ReminderTests(unittest.TestCase):
         click("menu:more:" + data["token"])
         message("20:00")
         click("menu:save:" + data["token"])
-        self.assertEqual(self.db.execute("SELECT name FROM reminders").fetchone()[0], "Vitamin D")
+        self.assertEqual(self.bot.privacy.decrypt(self.db.execute("SELECT name FROM reminders").fetchone()[0]), "Vitamin D")
         self.assertEqual([r[0] for r in self.db.execute("SELECT clock FROM schedules ORDER BY clock")],
                          ["08:30", "20:00"])
         click("menu:add")
@@ -463,7 +550,7 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("not found", self.sent[-1][0][0])
         click(f"menu:rename:{reminder}")
         message("New")
-        self.assertEqual(self.db.execute("SELECT name FROM reminders").fetchone()[0], "New")
+        self.assertEqual(self.bot.privacy.decrypt(self.db.execute("SELECT name FROM reminders").fetchone()[0]), "New")
         click(f"menu:times:{reminder}")
         token = self.bot.flow(42)[1]["token"]
         click("menu:drop:" + token + ":08:00")
@@ -622,7 +709,7 @@ class ReminderTests(unittest.TestCase):
         message(42, "20:00")
         self.bot.menu_action(42, f"save:{token}", now)
         reminder = self.db.execute(
-            "SELECT id FROM reminders WHERE user_id = 42 AND name = 'Pill'"
+            "SELECT id FROM reminders WHERE user_id = 42"
         ).fetchone()[0]
         self.bot.menu_action(42, f"rename:{reminder}", now)
         check_prompt("name")
@@ -981,7 +1068,8 @@ class ReminderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already have"):
             self.bot.edit(42, second, "one", ["09:00"], now)
         with self.db:
-            self.db.execute("UPDATE reminders SET name = 'One' WHERE id = ?", (second,))
+            self.db.execute("UPDATE reminders SET name = ? WHERE id = ?",
+                            (self.bot.privacy.encrypt("One"), second))
         self.assertTrue(self.bot.edit(42, first, "One", ["09:00"], now))
         self.assertEqual(self.db.execute(
             "SELECT clock FROM schedules WHERE reminder_id = ?", (first,)

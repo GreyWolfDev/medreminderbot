@@ -41,6 +41,7 @@ class ReminderMixin:
                            SELECT DISTINCT user_id, ? FROM reminders""", (previous["value"],)
                     )
                 self.db.execute("INSERT INTO settings VALUES ('user_timezones_migrated', '1')")
+        self.privacy.initialize(self.db)
 
     def user_zone(self, user_id):
         row = self.db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -88,7 +89,7 @@ class ReminderMixin:
         with self.db:
             self.check_duplicate(user_id, name)
             result = self.db.execute("INSERT INTO reminders(user_id, name) VALUES (?, ?)",
-                                     (user_id, name))
+                                     (user_id, self.privacy.encrypt(name)))
             reminder_id = result.lastrowid
             self.db.executemany(
                 "INSERT INTO schedules(reminder_id, clock, next_due) VALUES (?, ?, ?)",
@@ -108,9 +109,10 @@ class ReminderMixin:
             ).fetchone()
             if not row:
                 return False
-            if name != row["name"]:
+            if name != self.privacy.decrypt(row["name"]):
                 self.check_duplicate(user_id, name, reminder_id)
-            self.db.execute("UPDATE reminders SET name = ? WHERE id = ?", (name, reminder_id))
+            self.db.execute("UPDATE reminders SET name = ? WHERE id = ?",
+                            (self.privacy.encrypt(name), reminder_id))
             existing = {slot["clock"]: slot["id"] for slot in self.db.execute(
                 "SELECT id, clock FROM schedules WHERE reminder_id = ?", (reminder_id,)
             )}
@@ -130,7 +132,7 @@ class ReminderMixin:
 
     def check_duplicate(self, user_id, name, exclude_id=None):
         rows = self.db.execute("SELECT id, name FROM reminders WHERE user_id = ?", (user_id,))
-        if any(row["id"] != exclude_id and row["name"].strip().casefold() == name.strip().casefold()
+        if any(row["id"] != exclude_id and self.privacy.decrypt(row["name"]).strip().casefold() == name.strip().casefold()
                for row in rows):
             raise ValueError("You already have a medication with that name. Enter a different name.")
 
@@ -189,7 +191,7 @@ class ReminderMixin:
 
     def dose_message(self, dose):
         scheduled = datetime.fromtimestamp(dose["due"], ZoneInfo(dose["timezone"]))
-        text = f"Medication reminder: {dose['name']}\nScheduled: {scheduled:%Y-%m-%d %H:%M %Z}"
+        text = f"Medication reminder: {self.privacy.decrypt(dose['name'])}\nScheduled: {scheduled:%Y-%m-%d %H:%M %Z}"
         markup = buttons([("✅ Taken", f"taken:{dose['id']}")])
         return text, markup
 

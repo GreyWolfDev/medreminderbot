@@ -22,6 +22,7 @@ service.** Delivery depends on the bot, network, Telegram, and your device.
   pending.
 - Recover missed doses after downtime. Pending doses survive restarts.
 - Set a time zone per user, with daylight-saving handling.
+- Encrypt medication names and unfinished conversation data in the database.
 - Optionally view private, admin-only usage counts for the last 90 days.
 
 | Main menu | Medications | Medication settings |
@@ -42,8 +43,13 @@ cd medreminderbot
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-pill.txt
 export BOT_TOKEN='your-token-from-botfather'
+export PILL_ENCRYPTION_KEY="$(.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 .venv/bin/python pill_reminder.py
 ```
+
+The command above generates a **new** key. Save it securely outside the database
+and reuse it on every restart; do not generate a replacement for an existing
+encrypted database. Losing the key makes encrypted data unrecoverable.
 
 In a private chat with the bot, send `/start` and enter an IANA time zone, such
 as `Europe/London` or `America/New_York`. The bot cannot determine it
@@ -53,15 +59,15 @@ supported.
 
 Run only one instance per bot and database. By default, the database is
 `pill_reminders.sqlite3` in the working directory. It contains sensitive
-medication names, schedules, pending doses, and user information: restrict
-access and back it up securely. Do not commit the database, environment files,
-or bot token.
+information even with encryption enabled: restrict access and back it up
+securely. Do not commit the database, environment files, key, or bot token.
 
 ## Configuration
 
 | Variable | Required | Meaning |
 |---|---|---|
 | `BOT_TOKEN` | Yes | Telegram token from BotFather. |
+| `PILL_ENCRYPTION_KEY` | Yes | Persistent Fernet key, stored separately from the database. |
 | `PILL_DB` | No | SQLite database path; defaults to `pill_reminders.sqlite3`. Its parent directory must exist and be writable. |
 | `PILL_ADMIN_ID` | No | Numeric Telegram user ID permitted to use `/stats` in a private chat. Send `/id` to obtain your ID. |
 | `PILL_LOG_TIMING` | No | Set to `1` to log Telegram API and update-processing timings. |
@@ -71,6 +77,20 @@ times. Activity events are retained in the database for approximately 90 days;
 system logs and backups have separate retention. Protect the database, logs,
 and administrator's Telegram account. The bot does not retain a
 medication-specific history of taken doses.
+
+## Privacy and encryption
+
+The bot encrypts medication names and unfinished conversation data using
+authenticated Fernet encryption before storing them in SQLite. The key is
+provided separately through `PILL_ENCRYPTION_KEY`. A missing, invalid, or
+incorrect key prevents startup rather than silently losing data.
+
+This protects a database file inspected without the key. It does **not** prevent
+a server administrator who can read the key, inspect the running bot, or
+modify its code from accessing names. Telegram messages contain names, and
+schedules, pending-dose metadata, user identities, and activity events are not
+encrypted. Old backups, snapshots, and storage remnants may also contain
+plaintext names. Protect the key, database, backups, logs, and Telegram accounts.
 
 ## Debian systemd service
 
@@ -88,9 +108,20 @@ Create `/etc/pill-reminder.env`, owned by root with mode `0600`, containing:
 ```text
 BOT_TOKEN=your-token-from-botfather
 PILL_DB=/var/lib/pill-reminder/pill_reminders.sqlite3
+PILL_ENCRYPTION_KEY=your-persistent-fernet-key
 # Optional:
 # PILL_ADMIN_ID=your-numeric-telegram-user-id
 ```
+
+Generate a key once with the following command and place it in the root-only
+environment file; don't share it or store its backup alongside the database:
+
+```sh
+/opt/pill-reminder/.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+Keep a secure separate backup of the key. The database and its backups cannot
+be decrypted without it.
 
 Create `/etc/systemd/system/pill-reminder.service`:
 
@@ -129,6 +160,24 @@ sudo journalctl -u pill-reminder -n 50 --no-pager
 Restart the service after updating the source or environment file. If the
 unit file changes, run `sudo systemctl daemon-reload` before restarting. The
 environment file is loaded by systemd, not by direct Python invocation.
+
+### Upgrading an existing database
+
+Stop the service and securely back up the database before upgrading. Make the
+backup while the bot is stopped, or use SQLite's backup API so committed data
+in any WAL is included. Pre-upgrade backups contain plaintext names.
+
+Install the updated requirements, generate a key once, and add it as
+`PILL_ENCRYPTION_KEY` to the protected environment file without removing the
+existing settings. Start the service and check its status and logs. On startup,
+the bot encrypts existing names and unfinished conversations transactionally,
+then vacuums the database and truncates its SQLite WAL before processing
+reminders. Interrupted cleanup is retried at startup; allow enough free disk
+space for SQLite's vacuum operation.
+
+Migration does not remove plaintext from old backups, snapshots, Telegram
+messages, or filesystem remnants. Older bot versions cannot read the encrypted
+database: to roll back, restore a protected pre-migration backup.
 
 ## Scheduling details
 
