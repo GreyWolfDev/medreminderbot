@@ -23,7 +23,9 @@ service.** Delivery depends on the bot, network, Telegram, and your device.
 - Recover missed doses after downtime. Pending doses survive restarts.
 - Set a time zone per user, with daylight-saving handling.
 - Encrypt medication names and unfinished conversation data in the database.
-- Optionally view private, admin-only usage counts for the last 90 days.
+- Optionally view private, admin-only usage counts for the last 90 days to
+  verify the bot is being used. These are activity statistics and do **not**
+  include medication names.
 
 | Main menu | Medications | Medication settings |
 |---|---|---|
