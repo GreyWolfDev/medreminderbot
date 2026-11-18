@@ -59,9 +59,17 @@ class ActivityMixin:
             parameters,
         ).fetchall()
         title = "Overall usage" if user_id is None else "Your usage"
+        lines = []
+        if user_id is None:
+            count = self.db.execute(
+                "SELECT COUNT(DISTINCT user_id) FROM activity_events WHERE occurred_at >= ?",
+                (now - ACTIVITY_RETENTION_SECONDS,),
+            ).fetchone()[0]
+            lines.append(f"Active users (last 90 days): {count}")
         if not rows:
-            return f"{title} in the last 90 days: no activity recorded."
-        lines = [f"{title} in the last 90 days:"]
+            lines.append(f"{title} in the last 90 days: no activity recorded.")
+            return "\n".join(lines)
+        lines.append(f"{title} in the last 90 days:")
         lines.extend(f"  {row['action']}: {row['count']}" for row in rows)
         return "\n".join(lines)
 

@@ -996,7 +996,7 @@ class ReminderTests(unittest.TestCase):
         with self.db:
             self.db.execute(
                 "INSERT INTO activity_events (user_id, occurred_at, action) VALUES (?, ?, ?)",
-                (42, now - ACTIVITY_RETENTION_SECONDS - 1, "old event"),
+                (77, now - ACTIVITY_RETENTION_SECONDS - 1, "old event"),
             )
         def request(user, chat_type="private"):
             self.bot.process_update({"message": {
@@ -1012,7 +1012,8 @@ class ReminderTests(unittest.TestCase):
                          "Your usage in the last 90 days:\n  added a medication: 2")
         request(123456789)
         report = self.sent[-1][0][0]
-        self.assertEqual(report, "Overall usage in the last 90 days:\n  added a medication: 3")
+        self.assertEqual(report, "Active users (last 90 days): 2\n"
+                         "Overall usage in the last 90 days:\n  added a medication: 3")
         self.assertNotIn('@newname', report)
         self.assertNotIn("ID 42", report)
         self.assertNotIn("ID 99", report)
@@ -1041,8 +1042,28 @@ class ReminderTests(unittest.TestCase):
                 [(user_id, now, "opened the menu") for user_id in range(1, 2001)],
             )
         report = self.bot.usage_report(now)
-        self.assertEqual(report, "Overall usage in the last 90 days:\n  opened the menu: 2000")
+        self.assertEqual(report, "Active users (last 90 days): 2000\n"
+                         "Overall usage in the last 90 days:\n  opened the menu: 2000")
         self.assertLessEqual(len(report), 4000)
+
+    def test_stats_active_users_empty_and_retention_boundary(self):
+        now = 1800000000
+        with self.db:
+            self.db.execute("DELETE FROM activity_events")
+        self.assertEqual(self.bot.usage_report(now),
+                         "Active users (last 90 days): 0\n"
+                         "Overall usage in the last 90 days: no activity recorded.")
+        with self.db:
+            self.db.executemany(
+                "INSERT INTO activity_events (user_id, occurred_at, action) VALUES (?, ?, ?)",
+                [(42, now - ACTIVITY_RETENTION_SECONDS, "opened the menu"),
+                 (42, now, "opened the menu"),
+                 (99, now - ACTIVITY_RETENTION_SECONDS - 1, "opened the menu")],
+            )
+        self.assertEqual(self.bot.usage_report(now),
+                         "Active users (last 90 days): 1\n"
+                         "Overall usage in the last 90 days:\n  opened the menu: 2")
+        self.assertNotIn("Active users", self.bot.usage_report(now, user_id=42))
 
     def test_stats_menu_matches_command_and_preserves_privacy(self):
         now = 1800000000
@@ -1082,6 +1103,10 @@ class ReminderTests(unittest.TestCase):
                 self.assertEqual(edit["message_id"], 77)
                 self.assertEqual(edit["text"], command_report)
                 self.assertIn(f"opened the menu: {expected}", edit["text"])
+                if user == 123456789:
+                    self.assertTrue(edit["text"].startswith("Active users (last 90 days): 2\n"))
+                else:
+                    self.assertNotIn("Active users", edit["text"])
                 self.assertIn("menu:home", str(edit["reply_markup"]))
                 self.assertEqual(len(self.sent), before)
                 self.assertEqual(self.bot.flow(user)[0], None)
