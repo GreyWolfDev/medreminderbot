@@ -866,7 +866,7 @@ class ReminderTests(unittest.TestCase):
             with self.assertRaisesRegex(TelegramResponseError, "HTTP 400"):
                 self.bot.api("editMessageText")
 
-    def test_register_start_preserves_existing_commands(self):
+    def test_register_commands_preserves_existing_commands(self):
         calls = []
         def api(method, **params):
             calls.append((method, params))
@@ -874,36 +874,52 @@ class ReminderTests(unittest.TestCase):
                 return [{"command": "help", "description": "Help"}]
             return True
         self.bot.api = api
-        self.bot.register_start_command()
+        self.bot.register_commands()
         self.assertEqual(calls, [
             ("getMyCommands", {}),
             ("setMyCommands", {"commands": [
                 {"command": "help", "description": "Help"},
                 {"command": "start", "description": "Open the reminder menu"},
+                {"command": "stats", "description": "View usage statistics"},
             ]}),
         ])
 
-    def test_register_start_is_idempotent_and_handles_bad_response(self):
+    def test_register_commands_is_idempotent_and_handles_bad_response(self):
         calls = []
         self.bot.api = lambda method, **kw: calls.append(method) or [
-            {"command": "start", "description": "Existing description"}
+            {"command": "start", "description": "Existing description"},
+            {"command": "stats", "description": "Existing stats"},
         ]
-        self.bot.register_start_command()
+        self.bot.register_commands()
         self.assertEqual(calls, ["getMyCommands"])
         self.bot.api = lambda method, **kw: {"command": "start"}
         with self.assertRaisesRegex(TelegramError, "invalid command list"):
-            self.bot.register_start_command()
+            self.bot.register_commands()
         self.bot.api = lambda method, **kw: [] if method == "getMyCommands" else False
         with self.assertRaisesRegex(TelegramError, "not confirmed"):
-            self.bot.register_start_command()
+            self.bot.register_commands()
+
+    def test_register_commands_adds_stats_when_start_already_exists(self):
+        calls = []
+        def api(method, **params):
+            calls.append((method, params))
+            if method == "getMyCommands":
+                return [{"command": "start", "description": "Existing description"}]
+            return True
+        self.bot.api = api
+        self.bot.register_commands()
+        self.assertEqual(calls[-1], ("setMyCommands", {"commands": [
+            {"command": "start", "description": "Existing description"},
+            {"command": "stats", "description": "View usage statistics"},
+        ]}))
 
     def test_run_registers_at_start_and_survives_registration_failure(self):
-        self.bot.register_start_command = lambda: (_ for _ in ()).throw(TelegramError("offline"))
+        self.bot.register_commands = lambda: (_ for _ in ()).throw(TelegramError("offline"))
         with patch.object(self.bot, "tick", side_effect=KeyboardInterrupt) as tick:
             with self.assertLogs("pill_reminder", level="WARNING") as logs:
                 with self.assertRaises(KeyboardInterrupt):
                     self.bot.run()
-        self.assertIn("Could not register /start", logs.output[0])
+        self.assertIn("Could not register bot commands", logs.output[0])
         tick.assert_called_once()
 
     def test_activity_logs_identity_and_no_medication_details(self):
@@ -966,13 +982,16 @@ class ReminderTests(unittest.TestCase):
             self.bot.tick(stamp(2026, 1, 1, 8))
         self.assertNotIn("was sent a medication reminder", "\n".join(logs.output))
 
-    def test_stats_admin_restriction_counts_and_retention(self):
+    def test_stats_personal_and_admin_totals_and_retention(self):
         now = 1800000000
         self.bot.admin_id = 123456789
+        with self.db:
+            self.db.execute("DELETE FROM activity_events")
         self.bot.remember_identity({"id": 42, "first_name": "Old Name"})
         with patch("pill_reminder.time.time", return_value=now):
             self.bot.add(42, "SecretMedicine", ["08:00"], now)
             self.bot.add(99, "OtherSecret", ["09:00"], now)
+            self.bot.add(99, "SecondSecret", ["10:00"], now)
         self.bot.remember_identity({"id": 42, "username": "newname"})
         with self.db:
             self.db.execute(
@@ -986,14 +1005,17 @@ class ReminderTests(unittest.TestCase):
             }}, now)
 
         request(42)
-        self.assertEqual(self.sent[-1][0][0], "Not authorized.")
+        personal = self.sent[-1][0][0]
+        self.assertEqual(personal, "Your usage in the last 90 days:\n  added a medication: 1")
+        request(99)
+        self.assertEqual(self.sent[-1][0][0],
+                         "Your usage in the last 90 days:\n  added a medication: 2")
         request(123456789)
         report = self.sent[-1][0][0]
-        self.assertIn('@newname', report)
-        self.assertIn("ID 42", report)
-        self.assertIn("ID 99", report)
-        self.assertIn("Overall totals:", report)
-        self.assertIn("added a medication: 2", report)
+        self.assertEqual(report, "Overall usage in the last 90 days:\n  added a medication: 3")
+        self.assertNotIn('@newname', report)
+        self.assertNotIn("ID 42", report)
+        self.assertNotIn("ID 99", report)
         self.assertNotIn("old event", report)
         self.assertNotIn("SecretMedicine", report)
         self.assertNotIn("08:00", report)
@@ -1006,7 +1028,21 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(len(self.sent), before)
         self.bot.admin_id = None
         request(123456789)
-        self.assertEqual(self.sent[-1][0][0], "Not authorized.")
+        self.assertEqual(self.sent[-1][0][0], "Your usage in the last 90 days: no activity recorded.")
+        request(42)
+        self.assertEqual(self.sent[-1][0][0], personal)
+
+    def test_stats_totals_do_not_grow_with_user_count(self):
+        now = 1800000000
+        with self.db:
+            self.db.execute("DELETE FROM activity_events")
+            self.db.executemany(
+                "INSERT INTO activity_events (user_id, occurred_at, action) VALUES (?, ?, ?)",
+                [(user_id, now, "opened the menu") for user_id in range(1, 2001)],
+            )
+        report = self.bot.usage_report(now)
+        self.assertEqual(report, "Overall usage in the last 90 days:\n  opened the menu: 2000")
+        self.assertLessEqual(len(report), 4000)
 
     def test_activity_events_persist_across_restart(self):
         with TemporaryDirectory() as directory:
@@ -1020,8 +1056,8 @@ class ReminderTests(unittest.TestCase):
             db.close()
             db = connect(path)
             try:
-                report = ReminderBot("123:token", db).usage_report(1001)
-                self.assertIn("@alice", report)
+                report = ReminderBot("123:token", db).usage_report(1001, user_id=42)
+                self.assertNotIn("@alice", report)
                 self.assertIn("opened the menu: 1", report)
             finally:
                 db.close()

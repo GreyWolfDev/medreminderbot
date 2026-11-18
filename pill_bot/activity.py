@@ -47,30 +47,20 @@ class ActivityMixin:
                 (now - ACTIVITY_RETENTION_SECONDS,),
             )
 
-    def usage_report(self, now):
+    def usage_report(self, now, *, user_id=None):
+        condition = "" if user_id is None else " AND user_id = ?"
+        parameters = (now - ACTIVITY_RETENTION_SECONDS,)
+        if user_id is not None:
+            parameters += (user_id,)
         rows = self.db.execute(
-            """SELECT activity_events.user_id, user_identities.display_name,
-                      activity_events.action, COUNT(*) AS count
-               FROM activity_events
-               LEFT JOIN user_identities ON user_identities.user_id = activity_events.user_id
-               WHERE occurred_at >= ?
-               GROUP BY activity_events.user_id, activity_events.action
-               ORDER BY activity_events.user_id, activity_events.action""",
-            (now - ACTIVITY_RETENTION_SECONDS,),
+            """SELECT action, COUNT(*) AS count FROM activity_events
+               WHERE occurred_at >= ?""" + condition + """
+               GROUP BY action ORDER BY action""",
+            parameters,
         ).fetchall()
+        title = "Overall usage" if user_id is None else "Your usage"
         if not rows:
-            return "Usage in the last 90 days: no activity recorded."
-        totals = {}
-        lines = ["Usage in the last 90 days:"]
-        previous = None
-        for row in rows:
-            if row["user_id"] != previous:
-                previous = row["user_id"]
-                name = (json.dumps(row["display_name"], ensure_ascii=True)
-                        if row["display_name"] else "unknown")
-                lines.append(f"\nUser {name} (ID {previous}):")
-            lines.append(f"  {row['action']}: {row['count']}")
-            totals[row["action"]] = totals.get(row["action"], 0) + row["count"]
-        lines.append("\nOverall totals:")
-        lines.extend(f"  {action}: {count}" for action, count in sorted(totals.items()))
+            return f"{title} in the last 90 days: no activity recorded."
+        lines = [f"{title} in the last 90 days:"]
+        lines.extend(f"  {row['action']}: {row['count']}" for row in rows)
         return "\n".join(lines)

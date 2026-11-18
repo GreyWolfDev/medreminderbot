@@ -23,9 +23,9 @@ service.** Delivery depends on the bot, network, Telegram, and your device.
 - Recover missed doses after downtime. Pending doses survive restarts.
 - Set a time zone per user, with daylight-saving handling.
 - Encrypt medication names and unfinished conversation data in the database.
-- Optionally view private, admin-only usage counts for the last 90 days to
-  verify the bot is being used. These are activity statistics and do **not**
-  include medication names.
+- Use `/stats` in a private chat to see your own activity counts for the last
+  90 days. The configured admin sees totals across all users instead. Reports
+  contain no user names, IDs, or medication names.
 
 | Main menu | Medications | Medication settings |
 |---|---|---|
@@ -71,14 +71,15 @@ securely. Do not commit the database, environment files, key, or bot token.
 | `BOT_TOKEN` | Yes | Telegram token from BotFather. |
 | `PILL_ENCRYPTION_KEY` | Yes | Persistent Fernet key, stored separately from the database. |
 | `PILL_DB` | No | SQLite database path; defaults to `pill_reminders.sqlite3`. Its parent directory must exist and be writable. |
-| `PILL_ADMIN_ID` | No | Numeric Telegram user ID permitted to use `/stats` in a private chat. Send `/id` to obtain your ID. |
+| `PILL_ADMIN_ID` | No | Numeric Telegram user ID that receives aggregate `/stats` instead of personal counts. Send `/id` to obtain your ID. |
 | `PILL_LOG_TIMING` | No | Set to `1` to log Telegram API and update-processing timings. |
 
 The bot logs user identities and activity, but not medication names or dose
-times. Activity events are retained in the database for approximately 90 days;
-system logs and backups have separate retention. Protect the database, logs,
-and administrator's Telegram account. The bot does not retain a
-medication-specific history of taken doses.
+times. Activity events are linked to Telegram user IDs in the database to
+produce personal reports, and are retained for approximately 90 days. System
+logs and backups have separate retention. Protect the database, logs, and
+administrator's Telegram account. The bot does not retain a medication-specific
+history of taken doses.
 
 ## Privacy and encryption
 

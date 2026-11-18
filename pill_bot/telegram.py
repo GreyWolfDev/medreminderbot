@@ -40,18 +40,24 @@ class TelegramMixin:
             raise TelegramResponseError(f"{method}: Telegram rejected the request")
         return data["result"]
 
-    def register_start_command(self):
+    def register_commands(self):
         commands = self.api("getMyCommands")
         if (not isinstance(commands, list) or
                 any(not isinstance(item, dict) or not isinstance(item.get("command"), str)
                     or not isinstance(item.get("description"), str) for item in commands)):
             raise TelegramError("getMyCommands: invalid command list")
-        if any(item["command"] == "start" for item in commands):
+        existing = {item["command"] for item in commands}
+        additions = [
+            {"command": "start", "description": "Open the reminder menu"},
+            {"command": "stats", "description": "View usage statistics"},
+        ]
+        missing = [item for item in additions if item["command"] not in existing]
+        if not missing:
             return
-        commands.append({"command": "start", "description": "Open the reminder menu"})
+        commands.extend(missing)
         if self.api("setMyCommands", commands=commands) is not True:
             raise TelegramError("setMyCommands: registration was not confirmed")
-        LOG.info("Registered the /start command with Telegram.")
+        LOG.info("Registered bot commands with Telegram.")
 
     def send(self, text, markup=None, *, chat_id):
         if markup is not None and len(text) > 4000:

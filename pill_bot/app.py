@@ -103,10 +103,8 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         self.remember_identity(message["from"])
         text = message.get("text", "").strip()
         if text.split("@", 1)[0].split(" ", 1)[0].lower() == "/stats":
-            if self.admin_id is not None and user == self.admin_id:
-                self.send(self.usage_report(now), chat_id=user)
-            else:
-                self.send("Not authorized.", chat_id=user)
+            report_user = None if user == self.admin_id else user
+            self.send(self.usage_report(now, user_id=report_user), chat_id=user)
             return
         if text.split("@", 1)[0] in ("/start", "/help"):
             self.log_activity(user, "opened the menu")
@@ -173,10 +171,10 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
             now = int(time.time())
             if not commands_registered and now >= next_command_registration:
                 try:
-                    self.register_start_command()
+                    self.register_commands()
                     commands_registered = True
                 except TelegramError as exc:
-                    LOG.warning("Could not register /start: %s; retrying in five minutes", exc)
+                    LOG.warning("Could not register bot commands: %s; retrying in five minutes", exc)
                     next_command_registration = now + 300
             if now >= next_prune:
                 self.prune_activity(now)
