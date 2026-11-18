@@ -23,9 +23,9 @@ service.** Delivery depends on the bot, network, Telegram, and your device.
 - Recover missed doses after downtime. Pending doses survive restarts.
 - Set a time zone per user, with daylight-saving handling.
 - Encrypt medication names and unfinished conversation data in the database.
-- Use `/stats` in a private chat to see your own activity counts for the last
-  90 days. The configured admin sees totals across all users instead. Reports
-  contain no user names, IDs, or medication names.
+- Use **Stats** on the main menu or `/stats` in a private chat to see your own
+  activity counts for the last 90 days. The configured admin sees totals across
+  all users instead. Reports contain no user names, IDs, or medication names.
 
 | Main menu | Medications | Medication settings |
 |---|---|---|

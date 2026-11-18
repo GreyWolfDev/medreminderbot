@@ -103,8 +103,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         self.remember_identity(message["from"])
         text = message.get("text", "").strip()
         if text.split("@", 1)[0].split(" ", 1)[0].lower() == "/stats":
-            report_user = None if user == self.admin_id else user
-            self.send(self.usage_report(now, user_id=report_user), chat_id=user)
+            self.send(self.usage_report_for(user, now), chat_id=user)
             return
         if text.split("@", 1)[0] in ("/start", "/help"):
             self.log_activity(user, "opened the menu")

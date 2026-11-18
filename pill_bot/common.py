@@ -70,7 +70,7 @@ TIMEZONE_PROMPT = (
 def buttons(*rows):
     icons = {
         "menu:add": "➕", "menu:list:": "💊", "menu:pending": "🔔",
-        "menu:timezone": "🌍", "menu:home": "🏠", "menu:med:": "💊",
+        "menu:timezone": "🌍", "menu:stats": "📊", "menu:home": "🏠", "menu:med:": "💊",
         "menu:rename:": "✏️", "menu:times:": "🕒", "menu:toggle:": "⏯️",
         "menu:remove:": "🗑️", "menu:delete:": "🗑️", "menu:drop:": "➖",
         "menu:save:": "💾", "menu:more:": "➕", "menu:backtimes:": "⬅️",

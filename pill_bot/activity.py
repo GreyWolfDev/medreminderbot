@@ -64,3 +64,7 @@ class ActivityMixin:
         lines = [f"{title} in the last 90 days:"]
         lines.extend(f"  {row['action']}: {row['count']}" for row in rows)
         return "\n".join(lines)
+
+    def usage_report_for(self, user_id, now):
+        report_user = None if user_id == self.admin_id else user_id
+        return self.usage_report(now, user_id=report_user)

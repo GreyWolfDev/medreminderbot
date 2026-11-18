@@ -109,6 +109,7 @@ class MenuMixin:
         self.present(text, buttons(
             [("My medications", "menu:list:0")],
             [("Pending doses", "menu:pending"), ("Time zone", "menu:timezone")],
+            [("Stats", "menu:stats")],
         ), chat_id=user_id)
 
     def show_medications(self, user_id, page):
@@ -237,6 +238,10 @@ class MenuMixin:
             self.clear_flow(user_id)
             self.request_text(user_id, self.command(user_id, "/timezone", now),
                               buttons([("Cancel", "menu:home")]))
+        elif action == "stats":
+            self.clear_flow(user_id)
+            self.present(self.usage_report_for(user_id, now),
+                         buttons([("Main menu", "menu:home")]), chat_id=user_id)
         elif action.startswith("list:"):
             self.clear_flow(user_id)
             page = parse_id(action[5:]) if action[5:] != "0" else 0

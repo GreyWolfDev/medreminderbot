@@ -1044,6 +1044,56 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(report, "Overall usage in the last 90 days:\n  opened the menu: 2000")
         self.assertLessEqual(len(report), 4000)
 
+    def test_stats_menu_matches_command_and_preserves_privacy(self):
+        now = 1800000000
+        self.bot.admin_id = 123456789
+        with self.db:
+            self.db.execute("DELETE FROM activity_events")
+            self.db.executemany(
+                "INSERT INTO activity_events (user_id, occurred_at, action) VALUES (?, ?, ?)",
+                [(42, now, "opened the menu"), (99, now, "opened the menu"),
+                 (99, now, "opened the menu")],
+            )
+        self.bot.menu(42)
+        markup = self.sent[-1][0][1]
+        self.assertIn({"text": "📊 Stats", "callback_data": "menu:stats"},
+                      [button for row in markup["inline_keyboard"] for button in row])
+
+        calls = []
+        self.bot.api = lambda method, **kwargs: calls.append((method, kwargs))
+        for user, expected in ((42, 1), (99, 2), (123456789, 3)):
+            with self.subTest(user=user):
+                self.bot.process_update({"message": {
+                    "chat": {"id": user, "type": "private"}, "from": {"id": user},
+                    "text": "/stats",
+                }}, now)
+                command_report = self.sent[-1][0][0]
+                self.bot.set_flow(user, "add_name", {})
+                calls.clear()
+                before = len(self.sent)
+                self.bot.process_update({"callback_query": {
+                    "id": "click", "from": {"id": user}, "data": "menu:stats",
+                    "message": {"message_id": 77, "chat": {"id": user, "type": "private"}},
+                }}, now)
+                self.assertEqual([call[0] for call in calls],
+                                 ["answerCallbackQuery", "editMessageText"])
+                edit = calls[-1][1]
+                self.assertEqual(edit["chat_id"], user)
+                self.assertEqual(edit["message_id"], 77)
+                self.assertEqual(edit["text"], command_report)
+                self.assertIn(f"opened the menu: {expected}", edit["text"])
+                self.assertIn("menu:home", str(edit["reply_markup"]))
+                self.assertEqual(len(self.sent), before)
+                self.assertEqual(self.bot.flow(user)[0], None)
+
+        calls.clear()
+        self.bot.process_update({"callback_query": {
+            "id": "back", "from": {"id": 42}, "data": "menu:home",
+            "message": {"message_id": 77, "chat": {"id": 42, "type": "private"}},
+        }}, now)
+        self.assertEqual(calls[-1][0], "editMessageText")
+        self.assertIn("menu:stats", str(calls[-1][1]["reply_markup"]))
+
     def test_activity_events_persist_across_restart(self):
         with TemporaryDirectory() as directory:
             path = str(Path(directory) / "activity.sqlite3")
