@@ -4,6 +4,9 @@ A multi-user Telegram bot for daily medication reminders. Each user manages
 their own medications in a private chat, with times interpreted in their chosen
 IANA time zone.
 
+The bot is already running at [@tablet_reminderbot](https://t.me/tablet_reminderbot).
+Open a private chat and send `/start` to get started.
+
 **This is a convenience reminder, not a medical monitoring or emergency
 service.** Delivery depends on the bot, network, Telegram, and your device.
 
