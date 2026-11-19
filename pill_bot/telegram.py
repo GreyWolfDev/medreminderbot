@@ -15,7 +15,11 @@ class TelegramError(Exception):
 
 
 class TelegramResponseError(TelegramError):
-    pass
+    """Telegram answered but refused the request; description is Telegram's reason, if given."""
+
+    def __init__(self, message, *, description=None):
+        super().__init__(message)
+        self.description = description
 
 
 class TelegramMixin:
@@ -28,7 +32,15 @@ class TelegramMixin:
                     json=params, timeout=20, allow_redirects=False,
                 ) as response:
                     if not 200 <= response.status_code < 300:
-                        raise TelegramResponseError(f"{method}: HTTP {response.status_code}")
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            body = None
+                        description = body.get("description") if isinstance(body, dict) else None
+                        raise TelegramResponseError(
+                            f"{method}: HTTP {response.status_code}",
+                            description=description if isinstance(description, str) else None,
+                        )
                     data = response.json()
             except (requests.RequestException, ValueError):
                 self.http.close()
@@ -82,6 +94,9 @@ class TelegramMixin:
         try:
             self.api("editMessageText", **params)
         except TelegramResponseError as exc:
+            if "message is not modified" in (exc.description or "").lower():
+                # The same screen was requested again; it is already showing.
+                return
             LOG.warning("Could not edit menu message: %s; replacing it", exc)
             try:
                 self.api("deleteMessage", chat_id=chat_id, message_id=target[1])
