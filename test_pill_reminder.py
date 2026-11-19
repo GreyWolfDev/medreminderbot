@@ -560,9 +560,9 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT clock FROM schedules").fetchone()[0], "21:00")
         click("menu:save:" + token)
         self.assertIn("no longer active", self.sent[-1][0][0])
-        click(f"menu:toggle:{reminder}")
+        click(f"menu:pause:{reminder}")
         self.assertEqual(self.db.execute("SELECT enabled FROM reminders").fetchone()[0], 0)
-        click(f"menu:toggle:{reminder}")
+        click(f"menu:enable:{reminder}")
         self.assertEqual(self.db.execute("SELECT enabled FROM reminders").fetchone()[0], 1)
         click(f"menu:remove:{reminder}")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reminders").fetchone()[0], 1)
@@ -570,6 +570,57 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reminders").fetchone()[0], 1)
         click(f"menu:delete:{reminder}")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reminders").fetchone()[0], 0)
+
+    def test_menu_pause_and_enable_buttons_are_explicit_and_idempotent(self):
+        start = stamp(2026, 1, 1, 7)
+        reminder = self.bot.add(42, "Pill", ["08:00"], start)
+        self.bot.api = lambda method, **kw: True
+        def click(action, now=start):
+            self.bot.process_update({"callback_query": {
+                "id": "click", "from": {"id": 42}, "data": action,
+                "message": {"chat": {"id": 42, "type": "private"}},
+            }}, now)
+        def enabled():
+            return self.db.execute("SELECT enabled FROM reminders").fetchone()[0]
+        def callbacks():
+            markup = self.sent[-1][0][1]
+            return [button["callback_data"] for row in markup["inline_keyboard"] for button in row]
+
+        click(f"menu:med:{reminder}")
+        self.assertIn(f"menu:pause:{reminder}", callbacks())
+        self.assertNotIn(f"menu:toggle:{reminder}", callbacks())
+        self.assertLessEqual(len(f"menu:enable:{2 ** 63 - 1}".encode()), 64)
+
+        # A stale Pause pressed after the medication was paused elsewhere keeps it paused.
+        self.assertEqual(self.bot.command(42, f"/disable {reminder}", start), "Reminder paused.")
+        click(f"menu:pause:{reminder}")
+        click(f"menu:pause:{reminder}")
+        self.assertEqual(enabled(), 0)
+        self.assertIn("Status: paused", self.sent[-1][0][0])
+        self.assertIn(f"menu:enable:{reminder}", callbacks())
+
+        # Enabling recomputes the next dose without backfilling, and a repeat changes nothing.
+        later = stamp(2026, 1, 3, 10)
+        click(f"menu:enable:{reminder}", later)
+        next_due = self.db.execute("SELECT next_due FROM schedules").fetchone()[0]
+        self.assertEqual(next_due, stamp(2026, 1, 4, 8))
+        click(f"menu:enable:{reminder}", later)
+        self.assertEqual(enabled(), 1)
+        self.assertEqual(self.db.execute("SELECT next_due FROM schedules").fetchone()[0], next_due)
+        self.assertEqual(self.doses(), [])
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM activity_events WHERE action = 'enabled a medication'"
+        ).fetchone()[0], 1)
+        self.assertIn(f"menu:pause:{reminder}", callbacks())
+
+        # Buttons from messages sent before this change only re-show the current state.
+        click(f"menu:toggle:{reminder}", later)
+        self.assertEqual(enabled(), 1)
+        self.assertIn("Status: active", self.sent[-1][0][0])
+        self.bot.set_enabled(42, reminder, False, later)
+        click(f"menu:toggle:{reminder}", later)
+        self.assertEqual(enabled(), 0)
+        self.assertIn(f"menu:enable:{reminder}", callbacks())
 
     def test_menu_callback_edits_pressed_message(self):
         calls = []

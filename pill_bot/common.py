@@ -71,7 +71,8 @@ def buttons(*rows):
     icons = {
         "menu:add": "➕", "menu:list:": "💊", "menu:pending": "🔔",
         "menu:timezone": "🌍", "menu:stats": "📊", "menu:home": "🏠", "menu:med:": "💊",
-        "menu:rename:": "✏️", "menu:times:": "🕒", "menu:toggle:": "⏯️",
+        "menu:rename:": "✏️", "menu:times:": "🕒", "menu:pause:": "⏯️",
+        "menu:enable:": "⏯️",
         "menu:remove:": "🗑️", "menu:delete:": "🗑️", "menu:drop:": "➖",
         "menu:save:": "💾", "menu:more:": "➕", "menu:backtimes:": "⬅️",
     }
