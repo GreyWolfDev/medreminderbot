@@ -6,9 +6,30 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .common import TIMEZONE_PROMPT, buttons, next_occurrence
-from .telegram import TelegramError
+from .telegram import TelegramError, TelegramResponseError
 
 LOG = logging.getLogger("pill_reminder")
+
+
+def error_code(exc):
+    if not isinstance(exc, TelegramResponseError):
+        return None
+    return exc.error_code or exc.status
+
+
+def chat_unavailable(exc):
+    """True when Telegram itself says this chat can no longer receive messages.
+
+    Only Telegram's JSON error_code counts, so a bare HTTP 403 or 400 from a
+    proxy is treated as transient. 403 covers "bot was blocked by the user";
+    400 covers "chat not found" and "user is deactivated".
+    """
+    if not isinstance(exc, TelegramResponseError):
+        return False
+    description = (exc.description or "").lower()
+    return exc.error_code == 403 or (
+        exc.error_code == 400 and ("chat not found" in description
+                                   or "user is deactivated" in description))
 
 
 class ReminderMixin:
@@ -176,7 +197,7 @@ class ReminderMixin:
                 """SELECT schedules.*, users.timezone FROM schedules JOIN reminders
                    ON reminders.id = schedules.reminder_id
                    JOIN users ON users.user_id = reminders.user_id
-                   WHERE reminders.enabled = 1 AND next_due <= ?""", (now,)
+                   WHERE reminders.enabled = 1 AND users.unreachable = 0 AND next_due <= ?""", (now,)
             ).fetchall()
             for slot in slots:
                 due = slot["next_due"]
@@ -195,23 +216,77 @@ class ReminderMixin:
         markup = buttons([("✅ Taken", f"taken:{dose['id']}")])
         return text, markup
 
+    def mark_unreachable(self, user_id, exc):
+        with self.db:
+            self.db.execute("UPDATE users SET unreachable = 1 WHERE user_id = ?", (user_id,))
+        LOG.warning("Stopped reminders for user %s until they message the bot again: %s",
+                    user_id, exc)
+
+    def mark_reachable(self, user_id, now):
+        with self.db:
+            if not self.db.execute(
+                "UPDATE users SET unreachable = 0 WHERE user_id = ? AND unreachable = 1", (user_id,)
+            ).rowcount:
+                return
+            row = self.db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,)).fetchone()
+            if row["timezone"]:
+                zone = ZoneInfo(row["timezone"])
+                for slot in self.db.execute(
+                    """SELECT schedules.id, schedules.clock FROM schedules JOIN reminders
+                       ON reminders.id = schedules.reminder_id WHERE reminders.user_id = ?""",
+                    (user_id,)
+                ).fetchall():
+                    self.db.execute("UPDATE schedules SET next_due = ? WHERE id = ?",
+                                    (next_occurrence(slot["clock"], now, zone), slot["id"]))
+        LOG.info("Resumed reminders for user %s", user_id)
+
     def tick(self, now):
         self.create_due(now)
+        for dose_id in list(self.send_backoff):
+            if not self.db.execute("SELECT 1 FROM doses WHERE id = ?", (dose_id,)).fetchone():
+                del self.send_backoff[dose_id]
+        if now < self.flood_wait_until:
+            return
         doses = self.db.execute(
             """SELECT doses.id, doses.due, reminders.name, reminders.user_id, users.timezone
                FROM doses JOIN reminders
                ON reminders.id = doses.reminder_id
                JOIN users ON users.user_id = reminders.user_id
-               WHERE reminders.enabled = 1 AND doses.next_alert <= ?
+               WHERE reminders.enabled = 1 AND users.unreachable = 0
+                 AND doses.next_alert <= ?
                ORDER BY doses.next_alert, doses.id LIMIT 20""", (now,)
         ).fetchall()
+        unreachable = set()
         for dose in doses:
+            if dose["user_id"] in unreachable:
+                continue
             try:
                 self.send(*self.dose_message(dose), chat_id=dose["user_id"])
             except TelegramError as exc:
-                LOG.warning("Could not send dose %s: %s; retrying in one minute", dose["id"], exc)
-                next_alert = now + 60
+                if error_code(exc) == 429:
+                    wait = max(exc.retry_after or 60, 1)
+                    LOG.warning("Telegram flood control while sending dose %s; "
+                                "pausing deliveries for %s seconds", dose["id"], wait)
+                    self.flood_wait_until = int(time.time()) + wait
+                    with self.db:
+                        self.db.execute("UPDATE doses SET next_alert = ? WHERE id = ?",
+                                        (self.flood_wait_until, dose["id"]))
+                    break
+                if chat_unavailable(exc):
+                    self.send_backoff.pop(dose["id"], None)
+                    self.mark_unreachable(dose["user_id"], exc)
+                    unreachable.add(dose["user_id"])
+                    continue
+                if 400 <= (error_code(exc) or 0) < 500:
+                    delay = min(self.send_backoff.get(dose["id"], 30) * 2, 3600)
+                    self.send_backoff[dose["id"]] = delay
+                else:
+                    delay = 60
+                LOG.warning("Could not send dose %s: %s; retrying in %s seconds",
+                            dose["id"], exc, delay)
+                next_alert = now + delay
             else:
+                self.send_backoff.pop(dose["id"], None)
                 next_alert = int(time.time()) + 3600
                 self.log_activity(dose["user_id"], "was sent a medication reminder")
             with self.db:
