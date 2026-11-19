@@ -438,6 +438,35 @@ class ReminderTests(unittest.TestCase):
             "SELECT awaiting_timezone FROM users WHERE user_id = 77"
         ).fetchone()[0])
 
+    def test_timezone_rejects_long_folder_and_odd_names(self):
+        self.bot.api = lambda method, **kwargs: True
+        def message(text):
+            self.bot.process_update({"message": {
+                "chat": {"id": 77, "type": "private"}, "from": {"id": 77},
+                "text": text,
+            }}, stamp(2026, 1, 1, 7))
+            return self.sent[-1][0][0]
+
+        message("/start")
+        for value in ("a" * 300, "Europe/" + "x" * 300, "America", "Europe",
+                      "zone.tab", "../Europe/London", "Europe/London\x00"):
+            with self.subTest(value=value[:20]):
+                self.assertIn("Unknown time zone", message(value))
+                with self.assertRaisesRegex(ValueError, "Unknown time zone"):
+                    self.bot.command(77, "/timezone " + value, 0)
+        self.assertIsNone(self.db.execute(
+            "SELECT timezone FROM users WHERE user_id = 77").fetchone()["timezone"])
+        self.assertIn("Time zone set to Europe/Paris", message("Europe/Paris"))
+        self.assertEqual(self.bot.user_zone(77).key, "Europe/Paris")
+
+    def test_timezone_accepts_valid_and_case_variant_names(self):
+        for value, expected in (("UTC", "UTC"), ("utc", "UTC"), ("US/Eastern", "US/Eastern"),
+                                ("Etc/GMT+5", "Etc/GMT+5"), ("europe/london", "Europe/London"),
+                                ("America/Argentina/Buenos_Aires", "America/Argentina/Buenos_Aires")):
+            with self.subTest(value=value):
+                self.assertIn(f"Time zone set to {expected}.", self.bot.set_timezone(77, value, 0))
+                self.assertEqual(self.bot.user_zone(77).key, expected)
+
     def test_multiple_zones_and_clock_change_preserves_due(self):
         self.bot.set_timezone(99, "America/New_York", 0)
         now = stamp(2026, 1, 1, 7)
