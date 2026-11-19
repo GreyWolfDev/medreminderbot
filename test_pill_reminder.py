@@ -415,6 +415,31 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("Europe/London", message("Europe/London"))
         self.assertEqual(self.bot.user_zone(77).key, "Europe/London")
 
+    def test_timezone_command_ends_open_flow(self):
+        now = stamp(2026, 1, 1, 7)
+        self.bot.api = lambda method, **kwargs: True
+        def message(text):
+            self.bot.process_update({"message": {
+                "chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": text,
+            }}, now)
+            return self.sent[-1][0][0]
+
+        for command in ("/timezone", "/timezone Not/AZone"):
+            with self.subTest(command=command):
+                self.bot.menu_action(42, "add", now)
+                self.assertEqual(self.bot.flow(42)[0], "add_name")
+                self.assertIn("time zone", message(command))
+                self.assertIsNone(self.bot.flow(42)[0])
+                self.assertIn("Time zone set to Europe/Paris", message("Europe/Paris"))
+                self.assertEqual(message("Aspirin"), "Unknown command. Send /help for instructions.")
+                self.assertIsNone(self.bot.flow(42)[0])
+                self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reminders").fetchone()[0], 0)
+        self.bot.menu_action(42, "add", now)
+        self.assertIn("Time zone set to Europe/London", message("/timezone Europe/London"))
+        self.assertIsNone(self.bot.flow(42)[0])
+        message("Aspirin")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reminders").fetchone()[0], 0)
+
     def test_multiple_zones_and_clock_change_preserves_due(self):
         self.bot.set_timezone(99, "America/New_York", 0)
         now = stamp(2026, 1, 1, 7)

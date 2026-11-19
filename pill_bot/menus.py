@@ -13,6 +13,7 @@ class MenuMixin:
         command = command.split("@", 1)[0].lower()
         args = args.strip()
         if command == "/timezone":
+            self.clear_flow(user_id)
             if args:
                 return self.set_timezone(user_id, args, now)
             row = self.db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,)).fetchone()
