@@ -1,14 +1,30 @@
 """Reminder persistence and scheduled dose delivery."""
 
 import logging
+import re
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from functools import lru_cache
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from .common import TIMEZONE_PROMPT, buttons, next_occurrence
 from .telegram import TelegramError
 
 LOG = logging.getLogger("pill_reminder")
+
+ZONE_NAME_RE = re.compile(r"[A-Za-z0-9_+\-/]{1,64}\Z")
+
+
+@lru_cache(maxsize=None)
+def known_zones():
+    return {name.casefold(): name for name in available_timezones()}
+
+
+def zone_key(name):
+    """Return the canonical IANA name for user text, or None if it is not a known zone."""
+    if not ZONE_NAME_RE.match(name):
+        return None
+    return known_zones().get(name.casefold())
 
 
 class ReminderMixin:
@@ -51,8 +67,11 @@ class ReminderMixin:
 
     def set_timezone(self, user_id, name, now):
         try:
-            zone = ZoneInfo(name)
-        except (ValueError, ZoneInfoNotFoundError):
+            key = zone_key(name)
+            if key is None:
+                raise ValueError(name)
+            zone = ZoneInfo(key)
+        except (ValueError, ZoneInfoNotFoundError, OSError):
             self.prompt_timezone(user_id)
             raise ValueError("Unknown time zone. " + TIMEZONE_PROMPT) from None
         existing = self.db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,)).fetchone()
