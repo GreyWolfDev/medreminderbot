@@ -1,7 +1,9 @@
 """Database initialization, input validation, and shared scheduling helpers."""
 
+import os
 import re
 import sqlite3
+import traceback
 from datetime import datetime, timedelta
 
 
@@ -66,6 +68,17 @@ hourly until you press Taken. Send /start to return to the menu."""
 TIMEZONE_PROMPT = (
     "Send your IANA time zone, for example Europe/London or America/New_York."
 )
+
+def describe_error(exc):
+    """Name an unexpected error and where it was raised, without its message.
+
+    Exception messages can contain user text, medication details, or request URLs
+    that include the bot token, so only the type and source location are logged.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return type(exc).__name__
+    return f"{type(exc).__name__} at {os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
 
 def buttons(*rows):
     icons = {

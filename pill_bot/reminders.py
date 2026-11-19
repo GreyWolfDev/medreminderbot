@@ -1,11 +1,12 @@
 """Reminder persistence and scheduled dose delivery."""
 
 import logging
+import sqlite3
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .common import TIMEZONE_PROMPT, buttons, next_occurrence
+from .common import TIMEZONE_PROMPT, buttons, describe_error, next_occurrence
 from .telegram import TelegramError
 
 LOG = logging.getLogger("pill_reminder")
@@ -171,23 +172,37 @@ class ReminderMixin:
         return bool(removed)
 
     def create_due(self, now):
-        with self.db:
-            slots = self.db.execute(
-                """SELECT schedules.*, users.timezone FROM schedules JOIN reminders
-                   ON reminders.id = schedules.reminder_id
-                   JOIN users ON users.user_id = reminders.user_id
-                   WHERE reminders.enabled = 1 AND next_due <= ?""", (now,)
-            ).fetchall()
-            for slot in slots:
-                due = slot["next_due"]
-                zone = ZoneInfo(slot["timezone"])
-                while due <= now:
-                    self.db.execute(
-                        "INSERT INTO doses(reminder_id, due, next_alert) VALUES (?, ?, ?)",
-                        (slot["reminder_id"], due, now),
-                    )
-                    due = next_occurrence(slot["clock"], due, zone)
-                self.db.execute("UPDATE schedules SET next_due = ? WHERE id = ?", (due, slot["id"]))
+        slots = self.db.execute(
+            """SELECT schedules.*, users.timezone FROM schedules JOIN reminders
+               ON reminders.id = schedules.reminder_id
+               JOIN users ON users.user_id = reminders.user_id
+               WHERE reminders.enabled = 1 AND next_due <= ?""", (now,)
+        ).fetchall()
+        for slot in slots:
+            try:
+                # One transaction per slot: its doses and next_due change together.
+                with self.db:
+                    due = slot["next_due"]
+                    zone = ZoneInfo(slot["timezone"])
+                    while due <= now:
+                        self.db.execute(
+                            "INSERT INTO doses(reminder_id, due, next_alert) VALUES (?, ?, ?)",
+                            (slot["reminder_id"], due, now),
+                        )
+                        due = next_occurrence(slot["clock"], due, zone)
+                    self.db.execute("UPDATE schedules SET next_due = ? WHERE id = ?",
+                                    (due, slot["id"]))
+            except sqlite3.Error:
+                # A database fault is not specific to this slot; let the caller retry.
+                raise
+            except Exception as exc:
+                # A slot that cannot be scheduled (for example an unknown stored time
+                # zone) must not stop everyone else's reminders.
+                LOG.error("Could not schedule slot %s: %s; retrying in one hour",
+                          slot["id"], describe_error(exc))
+                with self.db:
+                    self.db.execute("UPDATE schedules SET next_due = ? WHERE id = ?",
+                                    (now + 3600, slot["id"]))
 
     def dose_message(self, dose):
         scheduled = datetime.fromtimestamp(dose["due"], ZoneInfo(dose["timezone"]))
@@ -207,13 +222,32 @@ class ReminderMixin:
         ).fetchall()
         for dose in doses:
             try:
-                self.send(*self.dose_message(dose), chat_id=dose["user_id"])
+                text, markup = self.dose_message(dose)
+            except Exception as exc:
+                # Skip this dose for an hour so it cannot block other reminders.
+                LOG.error("Could not prepare dose %s: %s; retrying in one hour",
+                          dose["id"], describe_error(exc))
+                self.set_next_alert(dose["id"], now + 3600)
+                continue
+            # Claim the dose before sending, so a database failure after a
+            # successful send cannot cause the same reminder to be sent again.
+            self.set_next_alert(dose["id"], int(time.time()) + 3600)
+            try:
+                self.send(text, markup, chat_id=dose["user_id"])
             except TelegramError as exc:
                 LOG.warning("Could not send dose %s: %s; retrying in one minute", dose["id"], exc)
-                next_alert = now + 60
-            else:
-                next_alert = int(time.time()) + 3600
+                self.set_next_alert(dose["id"], now + 60)
+                continue
+            except Exception as exc:
+                LOG.error("Could not send dose %s: %s; retrying with the hourly repeat",
+                          dose["id"], describe_error(exc))
+                continue
+            try:
                 self.log_activity(dose["user_id"], "was sent a medication reminder")
-            with self.db:
-                self.db.execute("UPDATE doses SET next_alert = ? WHERE id = ?",
-                                (next_alert, dose["id"]))
+            except Exception as exc:
+                LOG.error("Could not record reminder activity: %s", describe_error(exc))
+
+    def set_next_alert(self, dose_id, next_alert):
+        with self.db:
+            self.db.execute("UPDATE doses SET next_alert = ? WHERE id = ?",
+                            (next_alert, dose_id))
