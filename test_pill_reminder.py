@@ -150,6 +150,27 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Set BOT_TOKEN to your Telegram bot token.", result.stderr)
 
+    def test_unusable_database_path_exits_with_message(self):
+        source = Path(__file__).resolve().with_name("pill_reminder.py")
+        with TemporaryDirectory() as directory:
+            cases = [("missing directory", Path(directory) / "missing" / "reminders.sqlite3")]
+            if os.name == "posix" and os.geteuid() != 0:
+                read_only = Path(directory) / "read-only.sqlite3"
+                connect(str(read_only)).close()
+                read_only.chmod(0o400)
+                cases.append(("read-only file", read_only))
+            for name, path in cases:
+                with self.subTest(name):
+                    env = dict(os.environ, BOT_TOKEN="123:token", PILL_DB=str(path))
+                    env.pop("PILL_ADMIN_ID", None)
+                    result = subprocess.run(
+                        [sys.executable, str(source)], cwd=directory, env=env,
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(f"Cannot use database {path}: ", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
     def test_times_and_ids_validation(self):
         self.assertEqual(parse_times("20:00, 08:30"), ["08:30", "20:00"])
         for value in ("", "24:00", "8:00", "08:00,08:00", "09:60"):
