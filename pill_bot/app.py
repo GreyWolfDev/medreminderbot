@@ -42,7 +42,11 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
                 self.remember_identity(callback["from"])
                 action = callback.get("data", "")
                 if action.startswith("menu:"):
-                    self.api("answerCallbackQuery", callback_query_id=callback["id"])
+                    try:
+                        self.api("answerCallbackQuery", callback_query_id=callback["id"])
+                    except TelegramError as exc:
+                        # A stale query or network blip must not cost the user the action.
+                        LOG.warning("Could not answer menu button: %s", exc)
                     self.clear_reply_prompts(user)
                     message_id = callback.get("message", {}).get("message_id")
                     self.menu_message = (user, message_id) if isinstance(message_id, int) else None

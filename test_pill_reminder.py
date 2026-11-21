@@ -610,6 +610,29 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertIsNone(self.bot.menu_message)
 
+    def test_menu_action_runs_when_answering_callback_fails(self):
+        for failure in (TelegramResponseError("answerCallbackQuery: HTTP 400"),
+                        TelegramError("answerCallbackQuery: network or response error")):
+            with self.subTest(failure=type(failure).__name__):
+                calls = []
+                def api(method, **kw):
+                    calls.append(method)
+                    if method == "answerCallbackQuery":
+                        raise failure
+                self.bot.api = api
+                self.bot.clear_flow(42)
+                with self.assertLogs("pill_reminder", level="WARNING") as logs:
+                    self.bot.process_update({"callback_query": {
+                        "id": "old", "from": {"id": 42}, "data": "menu:add",
+                        "message": {"message_id": 100, "text": "PrivateMenuText",
+                                    "chat": {"id": 42, "type": "private"}},
+                    }}, stamp(2026, 1, 1, 7))
+                self.assertEqual(calls, ["answerCallbackQuery", "editMessageText"])
+                self.assertEqual(self.bot.flow(42)[0], "add_name")
+                self.assertIn("Could not answer menu button", logs.output[0])
+                self.assertNotIn("PrivateMenuText", "\n".join(logs.output))
+                self.assertIsNone(self.bot.menu_message)
+
     def test_medication_list_has_add_on_all_pages(self):
         now = stamp(2026, 1, 1, 7)
         for index in range(10):
