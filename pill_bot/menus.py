@@ -147,7 +147,8 @@ class MenuMixin:
         self.present(f"{self.privacy.decrypt(row['name'])}\nTimes: {', '.join(clocks)}\nStatus: {status}", buttons(
             [("Change name", f"menu:rename:{reminder_id}"),
              ("Change times", f"menu:times:{reminder_id}")],
-            [("Pause" if row["enabled"] else "Enable", f"menu:toggle:{reminder_id}")],
+            [("Pause", f"menu:pause:{reminder_id}") if row["enabled"]
+             else ("Enable", f"menu:enable:{reminder_id}")],
             [("Remove", f"menu:remove:{reminder_id}")],
             [("Back to medications", "menu:list:0"), ("Main menu", "menu:home")],
         ), chat_id=user_id)
@@ -288,7 +289,7 @@ class MenuMixin:
             else:
                 self.show_time_confirmation(user_id, data)
         else:
-            match = re.fullmatch(r"(med|rename|times|toggle|remove|delete):([0-9]{1,19})", action)
+            match = re.fullmatch(r"(med|rename|times|pause|enable|toggle|remove|delete):([0-9]{1,19})", action)
             if not match:
                 self.menu(user_id, "That button is not available.")
                 return
@@ -316,9 +317,12 @@ class MenuMixin:
                 data = {"id": reminder_id, "times": clocks, "mode": "edit"}
                 self.set_flow(user_id, "time_confirm", data)
                 self.show_time_confirmation(user_id, data)
-            elif operation == "toggle":
+            elif operation in ("pause", "enable"):
                 self.create_due(now)
-                self.set_enabled(user_id, reminder_id, not row["enabled"], now)
+                self.set_enabled(user_id, reminder_id, operation == "enable", now)
+                self.show_medication(user_id, reminder_id)
+            elif operation == "toggle":
+                # Older messages carry no intended state, so show the current one unchanged.
                 self.show_medication(user_id, reminder_id)
             elif operation == "remove":
                 self.present(f"Remove {self.privacy.decrypt(row['name'])} and all its pending doses?", buttons(
