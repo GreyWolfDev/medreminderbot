@@ -1,6 +1,7 @@
 import unittest
 import sqlite3
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -992,11 +993,14 @@ class ReminderTests(unittest.TestCase):
     def test_failed_or_other_users_actions_do_not_log_success(self):
         now = stamp(2026, 1, 1, 7)
         reminder = self.bot.add(42, "PrivateMedicine", ["08:00"], now)
-        with self.assertNoLogs("pill_reminder", level="INFO"):
+        # assertNoLogs needs Python 3.10; a sentinel keeps assertLogs from failing when empty.
+        with self.assertLogs("pill_reminder", level="INFO") as logs:
             self.assertFalse(self.bot.remove(99, reminder))
             self.assertFalse(self.bot.set_enabled(99, reminder, False, now))
             with self.assertRaises(ValueError):
                 self.bot.add(42, "privatemedicine", ["08:00"], now)
+            logging.getLogger("pill_reminder").info("sentinel")
+        self.assertEqual(logs.output, ["INFO:pill_reminder:sentinel"])
         self.bot.create_due(stamp(2026, 1, 1, 8))
         def fail(*args, **kwargs):
             raise TelegramError("unavailable")
