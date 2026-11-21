@@ -622,6 +622,28 @@ class ReminderTests(unittest.TestCase):
             self.assertEqual(len(add), 1)
             self.assertEqual(add[0]["text"], "➕ Add medication")
 
+    def test_medication_list_out_of_range_page_shows_empty_page(self):
+        now = stamp(2026, 1, 1, 7)
+        for index in range(10):
+            self.bot.add(42, f"Pill {index}", ["08:00"], now)
+        calls = []
+        self.bot.api = lambda method, **kw: calls.append((method, kw)) or True
+        for page in ("1152921504606846975", "1152921504606846976", "9223372036854775807"):
+            with self.subTest(page=page):
+                calls.clear()
+                self.bot.process_update({"callback_query": {
+                    "id": "click", "from": {"id": 42}, "data": "menu:list:" + page,
+                    "message": {"message_id": 5, "chat": {"id": 42, "type": "private"}},
+                }}, now)
+                edit = calls[-1][1]
+                self.assertEqual(edit["text"], "No medications on this page.")
+                data = [button["callback_data"] for row in edit["reply_markup"]["inline_keyboard"]
+                        for button in row]
+                self.assertIn("menu:add", data)
+                self.assertTrue(any(value.startswith("menu:list:") for value in data))
+        self.bot.show_medications(42, 1)
+        self.assertEqual(self.sent[-1][0][0], "Choose a medication.")
+
     def test_edit_times_add_remove_cancel_and_preserve_due(self):
         now = stamp(2026, 1, 1, 7)
         reminder = self.bot.add(42, "Pill", ["08:00", "20:00"], now)

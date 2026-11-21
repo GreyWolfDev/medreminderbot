@@ -6,6 +6,9 @@ import secrets
 
 from .common import HELP, buttons, parse_clock, parse_id, parse_name, parse_times
 
+# Largest page whose SQL OFFSET (page * 8) still fits in SQLite's 64-bit integer.
+MAX_LIST_PAGE = 9223372036854775807 // 8
+
 
 class MenuMixin:
     def command(self, user_id, text, now):
@@ -114,6 +117,7 @@ class MenuMixin:
 
     def show_medications(self, user_id, page):
         self.log_activity(user_id, "viewed their medications")
+        page = min(page, MAX_LIST_PAGE)
         rows = self.db.execute(
             """SELECT id, name, enabled FROM reminders WHERE user_id = ?
                ORDER BY id LIMIT 9 OFFSET ?""", (user_id, page * 8)
