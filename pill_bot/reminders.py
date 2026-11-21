@@ -52,7 +52,7 @@ class ReminderMixin:
     def set_timezone(self, user_id, name, now):
         try:
             zone = ZoneInfo(name)
-        except (ValueError, ZoneInfoNotFoundError):
+        except (ValueError, ZoneInfoNotFoundError, IsADirectoryError):
             self.prompt_timezone(user_id)
             raise ValueError("Unknown time zone. " + TIMEZONE_PROMPT) from None
         existing = self.db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,)).fetchone()

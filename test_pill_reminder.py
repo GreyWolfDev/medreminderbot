@@ -415,6 +415,29 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("Europe/London", message("Europe/London"))
         self.assertEqual(self.bot.user_zone(77).key, "Europe/London")
 
+    def test_directory_timezone_during_onboarding_allows_retry(self):
+        self.bot.api = lambda method, **kwargs: True
+        now = stamp(2026, 1, 1, 7)
+
+        def message(text):
+            self.bot.process_update({"message": {
+                "chat": {"id": 77, "type": "private"}, "from": {"id": 77},
+                "text": text,
+            }}, now)
+
+        message("/start")
+        # The tzdata fallback can open a directory when given a zone prefix.
+        with patch("pill_bot.reminders.ZoneInfo", side_effect=IsADirectoryError):
+            message("America/Indiana")
+        self.assertIn("Unknown time zone", self.sent[-1][0][0])
+        row = self.db.execute("SELECT * FROM users WHERE user_id = 77").fetchone()
+        self.assertTrue(row["awaiting_timezone"])
+        message("America/Indiana/Indianapolis")
+        self.assertEqual(self.bot.user_zone(77).key, "America/Indiana/Indianapolis")
+        self.assertFalse(self.db.execute(
+            "SELECT awaiting_timezone FROM users WHERE user_id = 77"
+        ).fetchone()[0])
+
     def test_multiple_zones_and_clock_change_preserves_due(self):
         self.bot.set_timezone(99, "America/New_York", 0)
         now = stamp(2026, 1, 1, 7)
