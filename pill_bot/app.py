@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from .activity import ActivityMixin
-from .common import HELP, buttons, parse_id
+from .common import HELP, buttons, describe_error, parse_id
 from .menus import MenuMixin
 from .privacy import Privacy
 from .reminders import ReminderMixin
@@ -28,6 +28,11 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         self.menu_message = None
         self.log_timing = os.environ.get("PILL_LOG_TIMING") == "1"
         self.http = requests.Session()
+
+    def discard_transaction(self):
+        # A failed step must not leave uncommitted writes behind for the next commit.
+        if self.db.in_transaction:
+            self.db.rollback()
 
     def process_update(self, update, now):
         message = update.get("message", {})
@@ -164,6 +169,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         stored = self.db.execute("SELECT value FROM settings WHERE key = 'offset'").fetchone()
         offset = int(stored["value"]) if stored else 0
         next_prune = 0
+        next_tick = 0
         next_command_registration = 0
         commands_registered = False
         while True:
@@ -176,28 +182,54 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
                     LOG.warning("Could not register bot commands: %s; retrying in five minutes", exc)
                     next_command_registration = now + 300
             if now >= next_prune:
-                self.prune_activity(now)
-                next_prune = now + 86400
-            self.tick(int(time.time()))
+                try:
+                    self.prune_activity(now)
+                    next_prune = now + 86400
+                except Exception as exc:
+                    self.discard_transaction()
+                    LOG.error("Could not prune activity: %s; retrying next cycle", describe_error(exc))
+            if now >= next_tick:
+                try:
+                    self.tick(int(time.time()))
+                except Exception as exc:
+                    # Back off so a persistent fault cannot resend reminders every cycle.
+                    self.discard_transaction()
+                    LOG.error("Could not deliver reminders: %s; retrying in one minute",
+                              describe_error(exc))
+                    next_tick = now + 60
             try:
                 updates = self.api("getUpdates", offset=offset, timeout=5,
                                    allowed_updates=["message", "callback_query"])
                 for update in updates:
                     started = time.monotonic()
                     try:
-                        self.create_due(int(time.time()))
+                        try:
+                            self.create_due(int(time.time()))
+                        except Exception as exc:
+                            self.discard_transaction()
+                            LOG.error("Could not create due doses: %s", describe_error(exc))
                         self.process_update(update, int(time.time()))
                     except TelegramError as exc:
+                        self.discard_transaction()
                         LOG.warning("Could not respond to update: %s", exc)
+                    except Exception as exc:
+                        self.discard_transaction()
+                        LOG.error("Could not process update %s: %s; skipping it",
+                                  update["update_id"], describe_error(exc))
                     finally:
                         if self.log_timing:
                             kind = "button" if "callback_query" in update else "message"
                             LOG.info("Processing %s update took %.3f seconds",
                                      kind, time.monotonic() - started)
                     offset = update["update_id"] + 1
-                    with self.db:
-                        self.db.execute("INSERT OR REPLACE INTO settings VALUES ('offset', ?)",
-                                        (str(offset),))
+                    try:
+                        with self.db:
+                            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('offset', ?)",
+                                            (str(offset),))
+                    except Exception as exc:
+                        # The next getUpdates call still confirms the update to Telegram.
+                        self.discard_transaction()
+                        LOG.error("Could not save polling offset: %s", describe_error(exc))
             except TelegramError as exc:
                 LOG.warning("Telegram polling failed: %s", exc)
                 time.sleep(5)

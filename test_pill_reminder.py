@@ -27,6 +27,29 @@ def stamp(year, month, day, hour, minute=0):
     return int(datetime(year, month, day, hour, minute, tzinfo=ZONE).timestamp())
 
 
+class FailingWrites:
+    """Wrap a connection so that statements matching `fails` raise while enabled."""
+
+    def __init__(self, db, fails):
+        self.db = db
+        self.fails = fails
+        self.enabled = False
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def __enter__(self):
+        return self.db.__enter__()
+
+    def __exit__(self, *details):
+        return self.db.__exit__(*details)
+
+    def execute(self, sql, *args):
+        if self.enabled and self.fails(sql):
+            raise sqlite3.OperationalError("database is locked")
+        return self.db.execute(sql, *args)
+
+
 class ReminderTests(unittest.TestCase):
     def setUp(self):
         self.key = Fernet.generate_key().decode("ascii")
@@ -944,6 +967,175 @@ class ReminderTests(unittest.TestCase):
                     self.bot.run()
         self.assertIn("Could not register bot commands", logs.output[0])
         tick.assert_called_once()
+
+    def test_run_skips_update_that_raises_unexpected_error(self):
+        self.bot.register_commands = lambda: None
+        polls = []
+        def api(method, **params):
+            polls.append(params["offset"])
+            if len(polls) > 1:
+                raise KeyboardInterrupt
+            return [{"update_id": 10, "message": {"text": "poison"}},
+                    {"update_id": 11, "message": {"text": "fine"}}]
+        processed = []
+        def process_update(update, now):
+            if update["update_id"] == 10:
+                self.db.execute("INSERT INTO settings VALUES ('half_written', '1')")
+                raise OverflowError("PrivateMedicine poison")
+            processed.append(update["update_id"])
+        self.bot.api = api
+        self.bot.process_update = process_update
+        with self.assertLogs("pill_reminder", level="ERROR") as logs:
+            with self.assertRaises(KeyboardInterrupt):
+                self.bot.run()
+        output = "\n".join(logs.output)
+        self.assertIn("Could not process update 10: OverflowError", output)
+        self.assertNotIn("PrivateMedicine", output)
+        self.assertEqual(processed, [11])
+        self.assertEqual(polls, [0, 12])
+        self.assertEqual(self.db.execute(
+            "SELECT value FROM settings WHERE key = 'offset'").fetchone()[0], "12")
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM settings WHERE key = 'half_written'").fetchone())
+        self.assertFalse(self.db.in_transaction)
+
+    def test_run_continues_after_tick_error_and_backs_off(self):
+        self.bot.register_commands = lambda: None
+        clock = [stamp(2026, 1, 1, 8)]
+        polls = []
+        def api(method, **params):
+            polls.append(clock[0])
+            clock[0] += 30
+            return []
+        self.bot.api = api
+        errors = [sqlite3.OperationalError("database is locked"), None, KeyboardInterrupt]
+        with patch("pill_reminder.time.time", side_effect=lambda: clock[0]):
+            with patch.object(self.bot, "tick", side_effect=errors) as tick:
+                with self.assertLogs("pill_reminder", level="ERROR") as logs:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.bot.run()
+        start = stamp(2026, 1, 1, 8)
+        self.assertEqual([call.args[0] for call in tick.call_args_list],
+                         [start, start + 60, start + 90])
+        self.assertEqual(polls, [start, start + 30, start + 60])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("Could not deliver reminders: OperationalError", logs.output[0])
+        self.assertNotIn("database is locked", logs.output[0])
+
+    def test_run_survives_offset_save_failure(self):
+        self.bot.register_commands = lambda: None
+        failing = FailingWrites(self.db, lambda sql: sql.startswith("INSERT OR REPLACE INTO settings"))
+        self.bot.db = failing
+        polls = []
+        def api(method, **params):
+            polls.append(params["offset"])
+            if len(polls) > 1:
+                raise KeyboardInterrupt
+            return [{"update_id": 10, "message": {}}]
+        processed = []
+        self.bot.api = api
+        def process_update(update, now):
+            processed.append(update["update_id"])
+            failing.enabled = True
+        self.bot.process_update = process_update
+        with patch.object(self.bot, "tick"):
+            with self.assertLogs("pill_reminder", level="ERROR") as logs:
+                with self.assertRaises(KeyboardInterrupt):
+                    self.bot.run()
+        self.assertEqual(processed, [10])
+        self.assertEqual(polls, [0, 11])
+        self.assertIn("Could not save polling offset: OperationalError", logs.output[0])
+        self.assertFalse(self.db.in_transaction)
+
+    def test_successful_send_is_not_repeated_after_database_failure(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        now = stamp(2026, 1, 1, 8)
+        failing = FailingWrites(self.db, lambda sql: sql.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE")))
+        self.bot.db = failing
+        def send(*args, **kwargs):
+            self.sent.append((args, kwargs))
+            failing.enabled = True
+        self.bot.send = send
+        with self.assertLogs("pill_reminder", level="ERROR") as logs:
+            for later in (0, 60, 120):
+                with patch("pill_reminder.time.time", return_value=now + later):
+                    self.bot.tick(now + later)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Could not record reminder activity: OperationalError", logs.output[0])
+        self.assertEqual(self.doses()[0]["next_alert"], now + 3600)
+        failing.enabled = False
+        self.bot.send = lambda *args, **kwargs: self.sent.append((args, kwargs))
+        with patch("pill_reminder.time.time", return_value=now + 3600):
+            self.bot.tick(now + 3600)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_undecryptable_dose_does_not_block_other_users(self):
+        self.bot.add(42, "Broken", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.add(99, "PrivateMedicine", ["08:00"], stamp(2026, 1, 1, 7))
+        with self.db:
+            self.db.execute("UPDATE reminders SET name = 'corrupt' WHERE user_id = 42")
+        now = stamp(2026, 1, 1, 8)
+        with self.assertLogs("pill_reminder", level="ERROR") as logs:
+            for later in (0, 3600):
+                with patch("pill_reminder.time.time", return_value=now + later):
+                    self.bot.tick(now + later)
+        self.assertEqual([entry[1]["chat_id"] for entry in self.sent], [99, 99])
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("Could not prepare dose 1: EncryptionError", logs.output[0])
+        self.assertNotIn("corrupt", "\n".join(logs.output))
+        self.assertEqual(self.db.execute(
+            "SELECT next_alert FROM doses WHERE id = 1").fetchone()[0], now + 7200)
+
+    def test_unknown_stored_zone_does_not_stop_other_users_doses(self):
+        start = stamp(2026, 1, 1, 7)
+        self.bot.set_timezone(1, "UTC", 0)
+        self.bot.set_timezone(2, "UTC", 0)
+        self.bot.add(1, "Fine", ["08:00"], start)
+        self.bot.add(2, "Broken", ["08:00"], start)
+        with self.db:
+            self.db.execute("UPDATE users SET timezone = 'Bad/Zone' WHERE user_id = 2")
+        now = int(datetime(2026, 1, 1, 8, tzinfo=ZoneInfo("UTC")).timestamp())
+        with self.assertLogs("pill_reminder", level="ERROR") as logs:
+            for later in (0, 60):
+                with patch("pill_reminder.time.time", return_value=now + later):
+                    self.bot.tick(now + later)
+                self.bot.create_due(now + later)
+        self.assertEqual([entry[1]["chat_id"] for entry in self.sent], [1])
+        self.assertEqual(self.db.execute(
+            """SELECT reminders.user_id FROM doses JOIN reminders
+               ON reminders.id = doses.reminder_id""").fetchall()[0][0], 1)
+        self.assertEqual(len(self.doses()), 1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("Could not schedule slot 2: ZoneInfoNotFoundError", logs.output[0])
+        self.assertNotIn("Bad/Zone", logs.output[0])
+        self.assertEqual(self.db.execute(
+            "SELECT next_due FROM schedules WHERE id = 2").fetchone()[0], now + 3600)
+        self.bot.create_due(now + 60)
+        self.assertEqual(len(self.doses()), 1)
+
+    def test_run_rolls_back_write_before_failed_telegram_reply(self):
+        self.bot.register_commands = lambda: None
+        polls = []
+        def api(method, **params):
+            polls.append(params["offset"])
+            if len(polls) > 1:
+                raise KeyboardInterrupt
+            return [{"update_id": 10, "message": {}}]
+        def process_update(update, now):
+            self.db.execute("INSERT INTO settings VALUES ('half_written', '1')")
+            raise TelegramError("sendMessage: HTTP 500")
+        self.bot.api = api
+        self.bot.process_update = process_update
+        with patch.object(self.bot, "tick"):
+            with self.assertLogs("pill_reminder", level="WARNING"):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.bot.run()
+        self.assertEqual(polls, [0, 11])
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM settings WHERE key = 'half_written'").fetchone())
+        self.assertEqual(self.db.execute(
+            "SELECT value FROM settings WHERE key = 'offset'").fetchone()[0], "11")
 
     def test_activity_logs_identity_and_no_medication_details(self):
         now = stamp(2026, 1, 1, 7)
