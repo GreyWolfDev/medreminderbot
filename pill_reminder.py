@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import sqlite3
 import time as time
 
 from pill_bot.app import ReminderBot
@@ -34,17 +35,23 @@ def main():
     except ValueError:
         raise SystemExit("PILL_ADMIN_ID must be a positive numeric Telegram ID.") from None
     os.umask(0o077)
+    path = os.environ.get("PILL_DB", "pill_reminders.sqlite3")
     try:
-        db = connect(os.environ.get("PILL_DB", "pill_reminders.sqlite3"))
+        db = connect(path)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
+    except sqlite3.Error as exc:
+        raise SystemExit(f"Cannot use database {path}: {exc}.") from None
     try:
         bot = ReminderBot(token, db, admin_id)
     except EncryptionError as exc:
         db.close()
         raise SystemExit(str(exc)) from None
     try:
-        bot.bind_database()
+        try:
+            bot.bind_database()
+        except sqlite3.Error as exc:
+            raise SystemExit(f"Cannot use database {path}: {exc}.") from None
         LOG.info("Multi-user reminder bot started.")
         bot.run()
     except (ValueError, EncryptionError) as exc:
