@@ -808,6 +808,44 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(len(logs.output), 2)
         self.assertEqual(self.sent[-1][0][0], "New menu")
 
+    def test_menu_unchanged_message_is_not_replaced(self):
+        methods = []
+        def post(url, **kwargs):
+            methods.append(url.rsplit("/", 1)[1])
+            response = requests.Response()
+            response.status_code = 400
+            response._content = (b'{"ok": false, "error_code": 400, "description": "Bad Request: '
+                                 b'message is not modified: specified new message content and '
+                                 b'reply markup are exactly the same"}')
+            response._content_consumed = True
+            return response
+        self.bot.menu_message = (42, 100)
+        with patch.object(self.bot.http, "post", side_effect=post):
+            with patch("pill_bot.telegram.LOG.warning") as warning:
+                self.bot.present("Same menu", chat_id=42)
+        warning.assert_not_called()
+        self.assertEqual(methods, ["editMessageText"])
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(self.bot.menu_message)
+
+    def test_api_rejection_keeps_telegram_description(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b'{"ok": false, "error_code": 400, "description": "Bad Request: chat not found"}'
+        with patch.object(self.bot.http, "post", return_value=response):
+            with self.assertRaises(TelegramResponseError) as raised:
+                self.bot.api("sendMessage", chat_id=42, text="private medication")
+        self.assertEqual(raised.exception.description, "Bad Request: chat not found")
+        self.assertNotIn("private medication", str(raised.exception))
+        self.assertNotIn("123:token", str(raised.exception))
+        response = requests.Response()
+        response.status_code = 502
+        response._content = b"<html>Bad Gateway</html>"
+        with patch.object(self.bot.http, "post", return_value=response):
+            with self.assertRaisesRegex(TelegramResponseError, "HTTP 502") as raised:
+                self.bot.api("editMessageText")
+        self.assertIsNone(raised.exception.description)
+
     def test_menu_network_failure_does_not_delete_message(self):
         calls = []
         def api(method, **kwargs):
