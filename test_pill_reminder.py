@@ -2,9 +2,11 @@ import unittest
 import sqlite3
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +17,7 @@ from zoneinfo import ZoneInfo
 import requests
 from cryptography.fernet import Fernet
 
+import pill_reminder
 from pill_reminder import (ACTIVITY_RETENTION_SECONDS, ReminderBot, TelegramError,
                            TelegramResponseError, connect, occurrence, parse_clock, parse_times)
 from pill_bot.privacy import EncryptionError
@@ -944,6 +947,67 @@ class ReminderTests(unittest.TestCase):
                     self.bot.run()
         self.assertIn("Could not register bot commands", logs.output[0])
         tick.assert_called_once()
+
+    def test_run_stops_after_committing_current_update(self):
+        self.bot.register_commands = lambda: None
+        polls = []
+        def api(method, **params):
+            polls.append(params["offset"])
+            if len(polls) > 1:
+                raise AssertionError("polled again after a stop request")
+            return [{"update_id": 10}, {"update_id": 11}]
+        processed = []
+        def process_update(update, now):
+            processed.append(update["update_id"])
+            self.bot.stopping = True
+        self.bot.api = api
+        self.bot.process_update = process_update
+        self.bot.run()
+        self.assertEqual(polls, [0])
+        self.assertEqual(processed, [10])
+        self.assertEqual(self.db.execute(
+            "SELECT value FROM settings WHERE key = 'offset'").fetchone()[0], "11")
+
+    def test_tick_stops_between_committed_doses(self):
+        self.bot.add(42, "First", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.add(42, "Second", ["08:00"], stamp(2026, 1, 1, 7))
+        now = stamp(2026, 1, 1, 8)
+        def send(*args, **kwargs):
+            self.sent.append((args, kwargs))
+            self.bot.stopping = True
+        self.bot.send = send
+        with patch("pill_reminder.time.time", return_value=now):
+            self.bot.tick(now)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual([dose["next_alert"] for dose in self.doses()], [now + 3600, now])
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM") and os.name == "posix", "needs POSIX signals")
+    def test_main_handles_sigterm_like_ctrl_c(self):
+        received = []
+        def outer_handler(signum, frame):
+            received.append(signum)
+        original = signal.signal(signal.SIGTERM, outer_handler)
+        self.addCleanup(signal.signal, signal.SIGTERM, original)
+        seen = []
+        def run(bot):
+            seen.append(bot.db)
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(100):
+                if bot.stopping:
+                    break
+                time.sleep(0.01)
+            seen.append(bot.stopping)
+        environment = {"BOT_TOKEN": "123:token", "PILL_DB": ":memory:", "PILL_ADMIN_ID": ""}
+        with patch.dict(os.environ, environment), patch.object(ReminderBot, "run", run), \
+                patch("pill_reminder.logging.basicConfig"), patch("pill_reminder.os.umask"):
+            with self.assertLogs("pill_reminder", level="INFO") as logs:
+                pill_reminder.main()
+        self.assertTrue(seen[1])
+        self.assertEqual(received, [])
+        self.assertIn("Bot stopped.", logs.output[-1])
+        self.assertIs(signal.getsignal(signal.SIGTERM), outer_handler)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            seen[0].execute("SELECT 1")
 
     def test_activity_logs_identity_and_no_medication_details(self):
         now = stamp(2026, 1, 1, 7)

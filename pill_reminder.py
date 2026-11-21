@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import signal
 import time as time
 
 from pill_bot.app import ReminderBot
@@ -43,15 +44,23 @@ def main():
     except EncryptionError as exc:
         db.close()
         raise SystemExit(str(exc)) from None
+    def request_stop(signum, frame):
+        # systemd stops services with SIGTERM; finish the current step, then exit.
+        bot.stopping = True
+
+    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
     try:
         bot.bind_database()
         LOG.info("Multi-user reminder bot started.")
         bot.run()
+        LOG.info("Bot stopped.")
     except (ValueError, EncryptionError) as exc:
         raise SystemExit(str(exc)) from None
     except KeyboardInterrupt:
         LOG.info("Bot stopped.")
     finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         bot.http.close()
         db.close()
 

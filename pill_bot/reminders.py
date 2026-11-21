@@ -206,6 +206,8 @@ class ReminderMixin:
                ORDER BY doses.next_alert, doses.id LIMIT 20""", (now,)
         ).fetchall()
         for dose in doses:
+            if self.stopping:
+                break
             try:
                 self.send(*self.dose_message(dose), chat_id=dose["user_id"])
             except TelegramError as exc:

@@ -28,6 +28,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         self.menu_message = None
         self.log_timing = os.environ.get("PILL_LOG_TIMING") == "1"
         self.http = requests.Session()
+        self.stopping = False
 
     def process_update(self, update, now):
         message = update.get("message", {})
@@ -166,7 +167,9 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         next_prune = 0
         next_command_registration = 0
         commands_registered = False
-        while True:
+        # stopping is set by a shutdown request; it is checked only between
+        # committed steps so a sent reminder or handled update is never replayed.
+        while not self.stopping:
             now = int(time.time())
             if not commands_registered and now >= next_command_registration:
                 try:
@@ -179,6 +182,8 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
                 self.prune_activity(now)
                 next_prune = now + 86400
             self.tick(int(time.time()))
+            if self.stopping:
+                break
             try:
                 updates = self.api("getUpdates", offset=offset, timeout=5,
                                    allowed_updates=["message", "callback_query"])
@@ -198,6 +203,8 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
                     with self.db:
                         self.db.execute("INSERT OR REPLACE INTO settings VALUES ('offset', ?)",
                                         (str(offset),))
+                    if self.stopping:
+                        break
             except TelegramError as exc:
                 LOG.warning("Telegram polling failed: %s", exc)
                 time.sleep(5)
