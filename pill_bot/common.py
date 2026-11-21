@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     timezone TEXT,
-    awaiting_timezone INTEGER NOT NULL DEFAULT 0
+    awaiting_timezone INTEGER NOT NULL DEFAULT 0,
+    unreachable INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS user_identities (
     user_id INTEGER PRIMARY KEY,
@@ -161,4 +162,7 @@ def connect(path):
             db.execute("ALTER TABLE reminders ADD COLUMN user_id INTEGER")
             if owner:
                 db.execute("UPDATE reminders SET user_id = ?", (int(owner["value"]),))
+    if "unreachable" not in {row["name"] for row in db.execute("PRAGMA table_info(users)")}:
+        with db:
+            db.execute("ALTER TABLE users ADD COLUMN unreachable INTEGER NOT NULL DEFAULT 0")
     return db

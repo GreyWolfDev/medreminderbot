@@ -28,6 +28,8 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         self.menu_message = None
         self.log_timing = os.environ.get("PILL_LOG_TIMING") == "1"
         self.http = requests.Session()
+        self.flood_wait_until = 0
+        self.send_backoff = {}
 
     def process_update(self, update, now):
         message = update.get("message", {})
@@ -40,6 +42,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
             confirmation = None
             if authorized:
                 self.remember_identity(callback["from"])
+                self.mark_reachable(user, now)
                 action = callback.get("data", "")
                 if action.startswith("menu:"):
                     self.api("answerCallbackQuery", callback_query_id=callback["id"])
@@ -101,6 +104,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
         if not isinstance(user, int) or user <= 0 or chat.get("type") != "private" or user != chat.get("id"):
             return
         self.remember_identity(message["from"])
+        self.mark_reachable(user, now)
         text = message.get("text", "").strip()
         if text.split("@", 1)[0].split(" ", 1)[0].lower() == "/stats":
             self.send(self.usage_report_for(user, now), chat_id=user)

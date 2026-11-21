@@ -233,6 +233,181 @@ class ReminderTests(unittest.TestCase):
             self.bot.tick(now)
         self.assertEqual(self.doses()[0]["next_alert"], now + 60)
 
+    def test_unreachable_user_is_skipped_until_they_return(self):
+        self.bot.api = lambda method, **kwargs: True
+        cases = (
+            (TelegramResponseError("blocked", status=403, error_code=403,
+                                   description="Forbidden: bot was blocked by the user"), "message"),
+            (TelegramResponseError("gone", status=400, error_code=400,
+                                   description="Bad Request: chat not found"), "callback"),
+            (TelegramResponseError("deactivated", status=400, error_code=400,
+                                   description="Bad Request: user is deactivated"), "message"),
+        )
+        for blocked_error, returns_with in cases:
+            with self.subTest(description=blocked_error.description):
+                with self.db:
+                    self.db.execute("DELETE FROM reminders")
+                    self.db.execute("UPDATE users SET unreachable = 0")
+                start = stamp(2026, 1, 1, 7)
+                active = self.bot.add(42, "PrivateMedicine", ["08:00"], start)
+                paused = self.bot.add(42, "Paused", ["08:00"], start)
+                self.bot.set_enabled(42, paused, False, start)
+                self.bot.add(99, "Other", ["08:00"], start)
+                attempts = []
+                def send(text, markup=None, *, chat_id):
+                    attempts.append(chat_id)
+                    if chat_id == 42:
+                        raise blocked_error
+                self.bot.send = send
+                def enabled():
+                    return [row[0] for row in self.db.execute(
+                        "SELECT enabled FROM reminders WHERE user_id = 42 ORDER BY id")]
+                def doses_for_42():
+                    return self.db.execute(
+                        """SELECT COUNT(*) FROM doses JOIN reminders ON reminders.id = doses.reminder_id
+                           WHERE reminders.user_id = 42""").fetchone()[0]
+                def unreachable():
+                    return self.db.execute(
+                        "SELECT unreachable FROM users WHERE user_id = 42").fetchone()[0]
+
+                now = stamp(2026, 1, 1, 8)
+                with patch("pill_reminder.time.time", return_value=now):
+                    with self.assertLogs("pill_reminder", level="WARNING") as logs:
+                        self.bot.tick(now)
+                warnings = [line for line in logs.output if "WARNING" in line]
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("Stopped reminders for user 42", warnings[0])
+                self.assertNotIn("PrivateMedicine", warnings[0])
+                self.assertEqual(attempts, [42, 99])
+                self.assertEqual(unreachable(), 1)
+                self.assertEqual(enabled(), [1, 0])
+                self.assertEqual(doses_for_42(), 1)
+
+                attempts.clear()
+                later = stamp(2026, 1, 3, 9)
+                with patch("pill_reminder.time.time", return_value=later):
+                    self.bot.tick(later)
+                self.assertNotIn(42, attempts)
+                self.assertIn(99, attempts)
+                self.assertEqual(doses_for_42(), 1)
+                self.assertEqual(enabled(), [1, 0])
+
+                self.bot.send = lambda text, markup=None, *, chat_id: attempts.append(chat_id)
+                if returns_with == "message":
+                    self.bot.process_update({"message": {
+                        "chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/id",
+                    }}, later)
+                else:
+                    self.bot.process_update({"callback_query": {
+                        "id": "click", "from": {"id": 42}, "data": "menu:home",
+                        "message": {"chat": {"id": 42, "type": "private"}},
+                    }}, later)
+                self.assertEqual(unreachable(), 0)
+                self.assertEqual(enabled(), [1, 0])
+                self.assertEqual(self.db.execute(
+                    "SELECT next_due FROM schedules WHERE reminder_id = ?", (active,)
+                ).fetchone()[0], stamp(2026, 1, 4, 8))
+                self.bot.create_due(later)
+                self.assertEqual(doses_for_42(), 1)
+                attempts.clear()
+                with patch("pill_reminder.time.time", return_value=later):
+                    self.bot.tick(later)
+                self.assertEqual(attempts.count(42), 1)
+
+    def test_bare_http_rejection_is_transient(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        now = stamp(2026, 1, 1, 8)
+        def forbidden(*args, **kwargs):
+            raise TelegramResponseError("sendMessage: HTTP 403", status=403)
+        self.bot.send = forbidden
+        with self.assertLogs("pill_reminder", level="WARNING") as logs:
+            self.bot.tick(now)
+        self.assertIn("retrying in 60 seconds", logs.output[0])
+        self.assertEqual(self.db.execute(
+            "SELECT unreachable FROM users WHERE user_id = 42").fetchone()[0], 0)
+        self.assertEqual(self.doses()[0]["next_alert"], now + 60)
+        with self.assertLogs("pill_reminder", level="WARNING"):
+            self.bot.tick(now + 60)
+        self.assertEqual(self.doses()[0]["next_alert"], now + 180)
+
+    def test_unreachable_column_added_to_existing_database(self):
+        with TemporaryDirectory() as directory:
+            path = str(Path(directory) / "old.sqlite3")
+            db = sqlite3.connect(path)
+            db.executescript("""
+                CREATE TABLE users (
+                    user_id INTEGER PRIMARY KEY,
+                    timezone TEXT,
+                    awaiting_timezone INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO users (user_id, timezone) VALUES (42, 'Europe/London');
+            """)
+            db.close()
+            db = connect(path)
+            try:
+                self.assertEqual(db.execute(
+                    "SELECT unreachable FROM users WHERE user_id = 42").fetchone()[0], 0)
+            finally:
+                db.close()
+
+    def test_flood_control_honours_retry_after(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.add(99, "Other", ["08:00"], stamp(2026, 1, 1, 7))
+        now = stamp(2026, 1, 1, 8)
+        attempts = []
+        def limited(text, markup=None, *, chat_id):
+            attempts.append(chat_id)
+            raise TelegramResponseError("flood", status=429, error_code=429,
+                                        description="Too Many Requests: retry after 30",
+                                        retry_after=30)
+        self.bot.send = limited
+        with patch("pill_reminder.time.time", return_value=now + 5):
+            with self.assertLogs("pill_reminder", level="WARNING"):
+                self.bot.tick(now)
+        self.assertEqual(attempts, [42])
+        self.assertEqual([dose["next_alert"] for dose in self.doses()], [now + 35, now])
+        self.bot.send = lambda text, markup=None, *, chat_id: attempts.append(chat_id)
+        attempts.clear()
+        self.bot.tick(now + 34)
+        self.assertEqual(attempts, [])
+        with patch("pill_reminder.time.time", return_value=now + 35):
+            self.bot.tick(now + 35)
+        self.assertEqual(sorted(attempts), [42, 99])
+
+    def test_rejected_delivery_backs_off_up_to_an_hour(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        now = stamp(2026, 1, 1, 8)
+        def unavailable(*args, **kwargs):
+            raise TelegramResponseError("unavailable", status=502)
+        self.bot.send = unavailable
+        for _ in range(2):
+            with self.assertLogs("pill_reminder", level="WARNING"):
+                self.bot.tick(now)
+            self.assertEqual(self.doses()[0]["next_alert"], now + 60)
+            now += 60
+        def rejected(*args, **kwargs):
+            raise TelegramResponseError("rejected", status=400, error_code=400,
+                                        description="Bad Request: message text is empty")
+        self.bot.send = rejected
+        delays = []
+        for _ in range(8):
+            with self.assertLogs("pill_reminder", level="WARNING"):
+                self.bot.tick(now)
+            next_alert = self.doses()[0]["next_alert"]
+            delays.append(next_alert - now)
+            now = next_alert
+        self.assertEqual(delays, [60, 120, 240, 480, 960, 1920, 3600, 3600])
+        dose_id = self.doses()[0]["id"]
+        self.bot.send = lambda *args, **kwargs: None
+        with patch("pill_reminder.time.time", return_value=now):
+            self.bot.tick(now)
+        self.assertEqual(self.bot.send_backoff, {})
+        self.bot.send_backoff[dose_id] = 3600
+        with self.db:
+            self.db.execute("DELETE FROM doses")
+        self.bot.tick(now)
+        self.assertEqual(self.bot.send_backoff, {})
+
     def test_unauthorized_callback_does_not_remove_dose(self):
         self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
         self.bot.create_due(stamp(2026, 1, 1, 8))
@@ -888,6 +1063,35 @@ class ReminderTests(unittest.TestCase):
         with patch.object(self.bot.http, "post", return_value=response):
             with self.assertRaisesRegex(TelegramResponseError, "HTTP 400"):
                 self.bot.api("editMessageText")
+
+    def test_api_rejection_keeps_telegram_details_without_request_data(self):
+        cases = (
+            (429, b'{"ok": false, "error_code": 429, "description": "Too Many Requests: retry after 7",'
+                  b' "parameters": {"retry_after": 7}}', 429, "Too Many Requests: retry after 7", 7),
+            (403, b'{"ok": false, "error_code": 403, "description": "Forbidden: bot was blocked by the user"}',
+             403, "Forbidden: bot was blocked by the user", None),
+            (502, b"<html>Bad Gateway</html>", None, None, None),
+            (200, b'{"ok": false, "error_code": 400, "description": "Bad Request: chat not found"}',
+             400, "Bad Request: chat not found", None),
+        )
+        for status, body, code, description, retry_after in cases:
+            with self.subTest(status=status):
+                response = requests.Response()
+                response.status_code = status
+                response._content = body
+                with patch.object(self.bot.http, "post", return_value=response):
+                    with self.assertRaises(TelegramResponseError) as raised:
+                        self.bot.api("sendMessage", chat_id=42, text="private medication")
+                error = raised.exception
+                self.assertEqual(error.status, status)
+                self.assertEqual(error.error_code, code)
+                self.assertEqual(error.description, description)
+                self.assertEqual(error.retry_after, retry_after)
+                if description:
+                    self.assertIn(description, str(error))
+                self.assertNotIn("123:token", str(error))
+                self.assertNotIn("private medication", str(error))
+                self.assertNotIn("api.telegram.org", str(error))
 
     def test_register_commands_preserves_existing_commands(self):
         calls = []

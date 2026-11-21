@@ -15,7 +15,45 @@ class TelegramError(Exception):
 
 
 class TelegramResponseError(TelegramError):
-    pass
+    """Telegram answered but refused the request.
+
+    status is the HTTP status; error_code, description and retry_after come
+    from Telegram's reply when it included them, and are None otherwise.
+    """
+
+    def __init__(self, message, *, status=None, error_code=None, description=None,
+                 retry_after=None):
+        super().__init__(message)
+        self.status = status
+        self.error_code = error_code
+        self.description = description
+        self.retry_after = retry_after
+
+
+def _int_field(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def rejection(method, status, data):
+    if not isinstance(data, dict):
+        data = {}
+    description = data.get("description")
+    if isinstance(description, str):
+        description = " ".join(description.split())[:200] or None
+    else:
+        description = None
+    parameters = data.get("parameters")
+    retry_after = _int_field(parameters.get("retry_after")) if isinstance(parameters, dict) else None
+    if retry_after is not None and retry_after < 0:
+        retry_after = None
+    if 200 <= status < 300:
+        message = f"{method}: Telegram rejected the request"
+    else:
+        message = f"{method}: HTTP {status}"
+    if description:
+        message += f": {description}"
+    return TelegramResponseError(message, status=status, error_code=_int_field(data.get("error_code")),
+                                 description=description, retry_after=retry_after)
 
 
 class TelegramMixin:
@@ -27,8 +65,13 @@ class TelegramMixin:
                     "https://api.telegram.org/bot" + self.token + "/" + method,
                     json=params, timeout=20, allow_redirects=False,
                 ) as response:
-                    if not 200 <= response.status_code < 300:
-                        raise TelegramResponseError(f"{method}: HTTP {response.status_code}")
+                    status = response.status_code
+                    if not 200 <= status < 300:
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            body = None
+                        raise rejection(method, status, body)
                     data = response.json()
             except (requests.RequestException, ValueError):
                 self.http.close()
@@ -37,7 +80,7 @@ class TelegramMixin:
             if self.log_timing:
                 LOG.info("Telegram %s took %.3f seconds", method, time.monotonic() - started)
         if not isinstance(data, dict) or not data.get("ok"):
-            raise TelegramResponseError(f"{method}: Telegram rejected the request")
+            raise rejection(method, status, data)
         return data["result"]
 
     def register_commands(self):
