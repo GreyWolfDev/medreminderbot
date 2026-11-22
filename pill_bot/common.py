@@ -7,6 +7,16 @@ from datetime import datetime, timedelta
 
 ACTIVITY_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
+# Per-user limits that keep one account from flooding its chat or the shared
+# send capacity. Tune them here.
+MAX_MEDICATIONS_PER_USER = 50
+# After downtime, only missed slots this recent become pending doses.
+CATCH_UP_SECONDS = 24 * 60 * 60
+# Pending doses stop repeating once this long past their scheduled time.
+REPEAT_WINDOW_SECONDS = 24 * 60 * 60
+# Pending-dose messages sent per request before a single summary line.
+MAX_PENDING_MESSAGES = 10
+
 TIME_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z")
 
 SCHEMA = """
@@ -61,7 +71,7 @@ CREATE INDEX IF NOT EXISTS doses_due_alert ON doses(next_alert);
 """
 
 HELP = """Choose an option below. Each scheduled dose is separate and repeats
-hourly until you press Taken. Send /start to return to the menu."""
+hourly for up to a day until you press Taken. Send /start to return to the menu."""
 
 TIMEZONE_PROMPT = (
     "Send your IANA time zone, for example Europe/London or America/New_York."

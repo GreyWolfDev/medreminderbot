@@ -164,10 +164,88 @@ class ReminderTests(unittest.TestCase):
         now = stamp(2026, 1, 3, 9)
         self.bot.create_due(now)
         self.bot.create_due(now)
+        # Only slots from the last 24 hours are recovered.
         self.assertEqual([d["due"] for d in self.doses()], [
-            stamp(2026, 1, 1, 8), stamp(2026, 1, 2, 8), stamp(2026, 1, 3, 8),
-            stamp(2026, 1, 1, 20), stamp(2026, 1, 2, 20),
+            stamp(2026, 1, 3, 8), stamp(2026, 1, 2, 20),
         ])
+        self.assertEqual([row[0] for row in self.db.execute(
+            "SELECT next_due FROM schedules ORDER BY clock")],
+            [stamp(2026, 1, 4, 8), stamp(2026, 1, 3, 20)])
+
+    def test_catch_up_after_long_outage_is_capped_to_one_day(self):
+        self.bot.add(42, "Pill", ["08:00", "12:00", "16:00", "20:00"], stamp(2026, 1, 1, 7))
+        now = stamp(2026, 1, 6, 7)
+        with patch("pill_reminder.time.time", return_value=now):
+            self.bot.tick(now)
+        self.assertEqual(sorted(d["due"] for d in self.doses()), [
+            stamp(2026, 1, 5, 8), stamp(2026, 1, 5, 12),
+            stamp(2026, 1, 5, 16), stamp(2026, 1, 5, 20),
+        ])
+        self.assertEqual(len(self.sent), 4)
+        self.bot.create_due(now)
+        self.assertEqual(len(self.doses()), 4)
+        self.bot.create_due(stamp(2026, 1, 6, 8))
+        self.assertEqual(len(self.doses()), 5)
+
+    def test_outage_does_not_resend_old_delivered_dose(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        with patch("pill_reminder.time.time", return_value=stamp(2026, 1, 1, 8)):
+            self.bot.tick(stamp(2026, 1, 1, 8))
+        self.sent.clear()
+        restart = stamp(2026, 1, 6, 7)
+        with patch("pill_reminder.time.time", return_value=restart):
+            self.bot.tick(restart)
+        self.assertEqual([entry[0][0].splitlines()[1] for entry in self.sent],
+                         ["Scheduled: 2026-01-05 08:00 GMT"])
+        self.assertEqual(len(self.doses()), 2)
+
+    def test_expired_doses_leave_the_alert_scan(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.create_due(stamp(2026, 1, 1, 8))
+        now = stamp(2026, 1, 2, 9)
+        with patch("pill_reminder.time.time", return_value=now):
+            self.bot.tick(now)
+        old, fresh = self.doses()
+        self.assertGreater(old["next_alert"], 2 ** 62)
+        self.assertLess(fresh["next_alert"], 2 ** 62)
+        # Expired doses are outside the next_alert <= now index range.
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM doses WHERE next_alert <= ?", (now + 10 ** 9,)
+        ).fetchone()[0], 1)
+        plan = " ".join(row[-1] for row in self.db.execute(
+            "EXPLAIN QUERY PLAN UPDATE doses SET next_alert = 0 WHERE next_alert <= ? AND due < ?",
+            (now, now)))
+        self.assertIn("doses_due_alert", plan)
+
+    def test_catch_up_includes_slot_exactly_one_day_old(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.create_due(stamp(2026, 1, 2, 8))
+        self.assertEqual([d["due"] for d in self.doses()],
+                         [stamp(2026, 1, 1, 8), stamp(2026, 1, 2, 8)])
+
+    def test_repeats_stop_a_day_after_due_but_dose_stays_pending(self):
+        self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        due = stamp(2026, 1, 1, 8)
+        for hour in range(28):
+            now = due + hour * 3600
+            with patch("pill_reminder.time.time", return_value=now):
+                self.bot.tick(now)
+        # Alerts at due, due + 1h, ..., due + 24h; later ones are not sent.
+        first_day = [entry for entry in self.sent if "2026-01-01 08:00" in entry[0][0]]
+        self.assertEqual(len(first_day), 25)
+        dose = self.doses()[0]
+        self.assertEqual(dose["due"], due)
+        self.assertGreater(dose["next_alert"], 2 ** 62)
+        self.sent.clear()
+        self.bot.show_pending(42)
+        self.assertIn("2026-01-01 08:00", self.sent[0][0][0])
+        calls = []
+        self.bot.api = lambda method, **kw: calls.append((method, kw))
+        self.bot.process_update({"callback_query": {
+            "id": "click", "from": {"id": 42}, "data": f"taken:{dose['id']}",
+            "message": {"message_id": 5, "chat": {"id": 42, "type": "private"}},
+        }}, due + 30 * 3600)
+        self.assertEqual(calls[-1][1]["text"], "Marked taken.")
 
     def test_hourly_repeat_taken_and_independent_doses(self):
         self.bot.add(42, "Pill", ["08:00", "09:00"], stamp(2026, 1, 1, 7))
@@ -210,9 +288,38 @@ class ReminderTests(unittest.TestCase):
         self.bot.set_enabled(42, reminder, True, stamp(2026, 1, 3, 10))
         with patch("pill_reminder.time.time", return_value=stamp(2026, 1, 3, 10)):
             self.bot.tick(stamp(2026, 1, 3, 10))
-        self.assertEqual(len(self.sent), 1)
+        # The paused dose is now more than a day old: still pending, no alert.
+        self.assertEqual(len(self.sent), 0)
+        self.assertEqual(len(self.doses()), 1)
         self.bot.create_due(stamp(2026, 1, 4, 8))
         self.assertEqual(len(self.doses()), 2)
+
+    def test_short_pause_resume_alerts_pending_dose(self):
+        reminder = self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.create_due(stamp(2026, 1, 1, 8))
+        self.bot.set_enabled(42, reminder, False, stamp(2026, 1, 1, 8))
+        self.bot.tick(stamp(2026, 1, 1, 12))
+        self.assertEqual(len(self.sent), 0)
+        self.bot.set_enabled(42, reminder, True, stamp(2026, 1, 1, 12))
+        with patch("pill_reminder.time.time", return_value=stamp(2026, 1, 1, 12)):
+            self.bot.tick(stamp(2026, 1, 1, 12))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_week_long_pause_does_not_alert_old_dose_on_resume(self):
+        reminder = self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
+        with patch("pill_reminder.time.time", return_value=stamp(2026, 1, 1, 8)):
+            self.bot.tick(stamp(2026, 1, 1, 8))
+        self.assertEqual(len(self.sent), 1)
+        self.bot.set_enabled(42, reminder, False, stamp(2026, 1, 1, 8, 30))
+        # No ticks while paused (worst case), then resume a week later.
+        resume = stamp(2026, 1, 8, 7)
+        self.bot.set_enabled(42, reminder, True, resume)
+        with patch("pill_reminder.time.time", return_value=resume):
+            self.bot.tick(resume)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.doses()), 1)
+        self.bot.show_pending(42)
+        self.assertIn("2026-01-01 08:00", self.sent[-1][0][0])
 
     def test_edit_preserves_pending_remove_deletes(self):
         reminder = self.bot.add(42, "Pill", ["08:00"], stamp(2026, 1, 1, 7))
@@ -322,7 +429,7 @@ class ReminderTests(unittest.TestCase):
                 bot.create_due(stamp(2026, 1, 3, 9))
                 rows = db.execute("SELECT due FROM doses ORDER BY due").fetchall()
                 self.assertEqual([row["due"] for row in rows], [
-                    stamp(2026, 1, 1, 8), stamp(2026, 1, 2, 8), stamp(2026, 1, 3, 8),
+                    stamp(2026, 1, 1, 8), stamp(2026, 1, 3, 8),
                 ])
             finally:
                 db.close()
@@ -621,6 +728,68 @@ class ReminderTests(unittest.TestCase):
             add = [button for button in buttons if button["callback_data"] == "menu:add"]
             self.assertEqual(len(add), 1)
             self.assertEqual(add[0]["text"], "➕ Add medication")
+
+    def test_medication_limit_applies_to_command_and_menu(self):
+        now = stamp(2026, 1, 1, 7)
+        self.bot.api = lambda method, **kw: True
+        for index in range(49):
+            self.bot.add(42, f"Pill {index}", ["08:00"], now)
+
+        def message(text, user=42):
+            self.bot.process_update({"message": {
+                "chat": {"id": user, "type": "private"}, "from": {"id": user}, "text": text,
+            }}, now)
+
+        def click(action):
+            self.bot.process_update({"callback_query": {
+                "id": "click", "from": {"id": 42}, "data": action,
+                "message": {"chat": {"id": 42, "type": "private"}},
+            }}, now)
+
+        # A menu flow started below the limit is rejected at save time.
+        click("menu:add")
+        message("Menu pill")
+        message("09:00")
+        token = self.bot.flow(42)[1]["token"]
+        message("/add Pill 49 | 08:00")
+        self.assertIn("Added reminder", self.sent[-1][0][0])
+        click("menu:save:" + token)
+        self.assertIn("at most 50 medications", self.sent[-1][0][0])
+        self.assertIn("menu:home", str(self.sent[-1][0][1]))
+        count = lambda user: self.db.execute(
+            "SELECT COUNT(*) FROM reminders WHERE user_id = ?", (user,)).fetchone()[0]
+        self.assertEqual(count(42), 50)
+        message("/add Extra | 08:00")
+        self.assertIn("at most 50 medications", self.sent[-1][0][0])
+        click("menu:rename:2")
+        click("menu:add")
+        self.assertIn("at most 50 medications", self.sent[-1][0][0])
+        self.assertEqual(self.bot.flow(42)[0], None)
+        self.assertEqual(count(42), 50)
+        message("/add Other | 08:00", 99)
+        self.assertIn("Added reminder", self.sent[-1][0][0])
+        self.bot.remove(42, 1)
+        message("/add Extra | 08:00")
+        self.assertIn("Added reminder", self.sent[-1][0][0])
+
+    def test_pending_output_is_capped_with_summary(self):
+        times = [f"{hour:02d}:00" for hour in range(8, 20)]
+        self.bot.add(42, "Many", times, stamp(2026, 1, 1, 7))
+        self.bot.add(42, "Other", ["08:00"], stamp(2026, 1, 1, 7))
+        self.bot.create_due(stamp(2026, 1, 1, 21))
+        self.assertEqual(len(self.doses()), 13)
+        self.bot.process_update({"message": {
+            "chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/pending",
+        }}, stamp(2026, 1, 1, 21))
+        self.assertEqual(len(self.sent), 11)
+        self.assertTrue(all("Medication reminder" in entry[0][0] for entry in self.sent[:10]))
+        self.assertIn("3 more pending doses", self.sent[-1][0][0])
+        self.sent.clear()
+        self.bot.api = lambda method, **kw: True
+        self.bot.menu_action(42, "pending", stamp(2026, 1, 1, 21))
+        self.assertEqual(len(self.sent), 12)
+        self.assertIn("3 more pending doses", self.sent[10][0][0])
+        self.assertEqual(len(self.doses()), 13)
 
     def test_edit_times_add_remove_cancel_and_preserve_due(self):
         now = stamp(2026, 1, 1, 7)

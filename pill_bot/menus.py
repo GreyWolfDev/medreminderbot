@@ -4,7 +4,8 @@ import json
 import re
 import secrets
 
-from .common import HELP, buttons, parse_clock, parse_id, parse_name, parse_times
+from .common import (HELP, MAX_PENDING_MESSAGES, buttons, parse_clock, parse_id, parse_name,
+                     parse_times)
 
 
 class MenuMixin:
@@ -76,11 +77,15 @@ class MenuMixin:
         ).fetchall()
         if not rows and empty_notice:
             self.send("No pending doses.", chat_id=user_id)
-        for row in rows:
+        for row in rows[:MAX_PENDING_MESSAGES]:
             text, markup = self.dose_message(row)
             if not row["enabled"]:
                 text += "\nPaused"
             self.send(text, markup, chat_id=user_id)
+        hidden = len(rows) - MAX_PENDING_MESSAGES
+        if hidden > 0:
+            self.send(f"…and {hidden} more pending dose{'s' if hidden != 1 else ''}. "
+                      "Mark these taken to see the rest.", chat_id=user_id)
         return bool(rows)
 
     def flow(self, user_id):
@@ -227,6 +232,8 @@ class MenuMixin:
                 self.request_text(user_id, self.prompt_timezone(user_id),
                                   buttons([("Cancel", "menu:home")]))
                 return
+            self.clear_flow(user_id)
+            self.check_medication_limit(user_id)
             self.set_flow(user_id, "add_name", {})
             self.request_text(user_id, "What is the medication's name?",
                               buttons([("Cancel", "menu:home")]))

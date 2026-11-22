@@ -14,13 +14,14 @@ service.** Delivery depends on the bot, network, Telegram, and your device.
 
 - Add, rename, pause, enable, or remove medications with buttons.
 - Add or remove individual daily times without re-entering the others.
-- Receive separate reminders for each scheduled dose, repeated hourly until
-  **Taken** is pressed. The selected notification then shows the taken time
-  and its button is removed.
-- View pending doses, including paused ones. Previously sent notifications for
-  a taken dose may still have buttons; they report that the dose is no longer
-  pending.
-- Recover missed doses after downtime. Pending doses survive restarts.
+- Receive separate reminders for each scheduled dose, repeated hourly for up
+  to 24 hours until **Taken** is pressed. The selected notification then shows
+  the taken time and its button is removed.
+- View pending doses, including paused ones, up to 10 at a time. Previously
+  sent notifications for a taken dose may still have buttons; they report that
+  the dose is no longer pending.
+- Recover doses missed in the last 24 hours after downtime. Pending doses
+  survive restarts.
 - Set a time zone per user, with daylight-saving handling.
 - Encrypt medication names and unfinished conversation data in the database.
 - Use **Stats** on the main menu or `/stats` in a private chat to see your own
@@ -188,10 +189,20 @@ database: to roll back, restore a protected pre-migration backup.
 Each scheduled time creates a separate dose. A successful notification repeats
 one hour after its previous delivery until that dose is marked taken. If
 delivery fails, it is logged and retried. If editing a notification fails after
-**Taken**, the dose remains marked taken and the failure is logged.
+**Taken**, the dose remains marked taken and the failure is logged. Repeats and
+retries stop once a dose is more than 24 hours past its scheduled time; it stays
+pending, appears under pending doses, and can still be marked taken.
 
-Pausing stops pending alerts and prevents new doses; enabling resumes pending
-alerts and future schedules without backfilling the paused period. Changing a
+After downtime, the bot creates doses only for times missed in the previous 24
+hours. Older missed times are skipped rather than sent all at once.
+
+Each user can have up to 50 medications, each with up to 12 daily times.
+Viewing pending doses sends the 10 oldest, then one message counting the rest.
+These limits are constants in `pill_bot/common.py`.
+
+Pausing stops pending alerts and prevents new doses; enabling resumes alerts
+for pending doses still within their 24-hour repeat window and future
+schedules without backfilling the paused period. Changing a
 schedule preserves existing pending doses and the next-due values of unchanged
 times. Newly added times start going forward.
 

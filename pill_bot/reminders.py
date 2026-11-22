@@ -5,10 +5,14 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .common import TIMEZONE_PROMPT, buttons, next_occurrence
+from .common import (CATCH_UP_SECONDS, MAX_MEDICATIONS_PER_USER, REPEAT_WINDOW_SECONDS,
+                     TIMEZONE_PROMPT, buttons, next_occurrence)
 from .telegram import TelegramError
 
 LOG = logging.getLogger("pill_reminder")
+
+# next_alert value for pending doses that should not alert again.
+NO_ALERT = 9223372036854775807
 
 
 class ReminderMixin:
@@ -87,6 +91,7 @@ class ReminderMixin:
     def add(self, user_id, name, clocks, now, *, finish_flow=False):
         zone = self.user_zone(user_id)
         with self.db:
+            self.check_medication_limit(user_id)
             self.check_duplicate(user_id, name)
             result = self.db.execute("INSERT INTO reminders(user_id, name) VALUES (?, ?)",
                                      (user_id, self.privacy.encrypt(name)))
@@ -129,6 +134,14 @@ class ReminderMixin:
                 self.db.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
         self.log_activity(user_id, "edited a medication")
         return True
+
+    def check_medication_limit(self, user_id):
+        count = self.db.execute(
+            "SELECT COUNT(*) FROM reminders WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        if count >= MAX_MEDICATIONS_PER_USER:
+            raise ValueError(f"You can have at most {MAX_MEDICATIONS_PER_USER} medications. "
+                             "Remove one before adding another.")
 
     def check_duplicate(self, user_id, name, exclude_id=None):
         rows = self.db.execute("SELECT id, name FROM reminders WHERE user_id = ?", (user_id,))
@@ -178,9 +191,13 @@ class ReminderMixin:
                    JOIN users ON users.user_id = reminders.user_id
                    WHERE reminders.enabled = 1 AND next_due <= ?""", (now,)
             ).fetchall()
+            cutoff = now - CATCH_UP_SECONDS
             for slot in slots:
                 due = slot["next_due"]
                 zone = ZoneInfo(slot["timezone"])
+                if due < cutoff:
+                    # Skip slots missed long ago; only recent ones become doses.
+                    due = next_occurrence(slot["clock"], cutoff - 1, zone)
                 while due <= now:
                     self.db.execute(
                         "INSERT INTO doses(reminder_id, due, next_alert) VALUES (?, ?, ?)",
@@ -197,6 +214,10 @@ class ReminderMixin:
 
     def tick(self, now):
         self.create_due(now)
+        with self.db:
+            # Doses past their repeat window stay pending but no longer alert.
+            self.db.execute("UPDATE doses SET next_alert = ? WHERE next_alert <= ? AND due < ?",
+                            (NO_ALERT, now, now - REPEAT_WINDOW_SECONDS))
         doses = self.db.execute(
             """SELECT doses.id, doses.due, reminders.name, reminders.user_id, users.timezone
                FROM doses JOIN reminders
