@@ -1,6 +1,7 @@
 import unittest
 import sqlite3
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -966,15 +967,21 @@ class ReminderTests(unittest.TestCase):
         self.assertNotIn("08:00", output)
         self.assertNotIn("09:00", output)
 
-    def test_activity_logs_delivery_and_taken_after_restart(self):
-        now = stamp(2026, 1, 1, 7)
+    def test_activity_log_escapes_identity(self):
         self.bot.remember_identity({"id": 42, "first_name": "Alice\nInjected"})
+        with self.assertLogs("pill_reminder", level="INFO") as logs:
+            self.bot.log_activity(42, "opened the menu")
+        self.assertIn('Alice\\nInjected', "\n".join(logs.output))
+
+    def test_dose_events_are_counted_but_not_logged_after_restart(self):
+        now = stamp(2026, 1, 1, 7)
+        self.bot.remember_identity({"id": 42, "first_name": "Alice"})
         self.bot.add(42, "PrivateMedicine", ["08:00"], now)
         restarted = ReminderBot("123:token", self.db)
         restarted.send = self.bot.send
         restarted.api = lambda method, **kwargs: None
         due = stamp(2026, 1, 1, 8)
-        with self.assertLogs("pill_reminder", level="INFO") as logs:
+        with self.assertLogs("pill_reminder", level="DEBUG") as logs:
             with patch("pill_reminder.time.time", return_value=due):
                 restarted.tick(due)
             dose_id = self.doses()[0]["id"]
@@ -982,12 +989,14 @@ class ReminderTests(unittest.TestCase):
                 "id": "click", "from": {"id": 42}, "data": f"taken:{dose_id}",
                 "message": {"message_id": 1, "chat": {"id": 42, "type": "private"}},
             }}, due)
-        output = "\n".join(logs.output)
-        self.assertIn('Alice\\nInjected', output)
-        self.assertIn("was sent a medication reminder", output)
-        self.assertIn("marked a dose taken", output)
-        self.assertNotIn("PrivateMedicine", output)
-        self.assertNotIn("08:00", output)
+            # assertLogs needs at least one record; nothing else may be logged.
+            logging.getLogger("pill_reminder").debug("end of dose events")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.doses()), 0)
+        self.assertEqual(logs.output, ["DEBUG:pill_reminder:end of dose events"])
+        report = restarted.usage_report(due, user_id=42)
+        self.assertIn("was sent a medication reminder: 1", report)
+        self.assertIn("marked a dose taken: 1", report)
 
     def test_failed_or_other_users_actions_do_not_log_success(self):
         now = stamp(2026, 1, 1, 7)

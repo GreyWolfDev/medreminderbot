@@ -28,12 +28,16 @@ class ActivityMixin:
                 (user_id, display_name),
             )
 
-    def log_activity(self, user_id, action):
+    def log_activity(self, user_id, action, *, private=False):
         with self.db:
             self.db.execute(
                 "INSERT INTO activity_events (user_id, occurred_at, action) VALUES (?, ?, ?)",
                 (user_id, int(time.time()), action),
             )
+        if private:
+            # Dose events are counted for /stats but not logged: timestamped
+            # log lines would record each user's dose schedule and adherence.
+            return
         row = self.db.execute(
             "SELECT display_name FROM user_identities WHERE user_id = ?", (user_id,)
         ).fetchone()
