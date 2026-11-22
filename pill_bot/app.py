@@ -75,7 +75,7 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
                             ).rowcount
                         answer = "Marked taken." if deleted else "Already taken or removed."
                         if deleted:
-                            self.log_activity(user, "marked a dose taken")
+                            self.log_activity(user, "marked a dose taken", private=True)
                             zone = ZoneInfo(dose["timezone"])
                             taken = datetime.fromtimestamp(now, zone)
                             original = callback["message"].get("text")

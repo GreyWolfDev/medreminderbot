@@ -75,12 +75,25 @@ securely. Do not commit the database, environment files, key, or bot token.
 | `PILL_ADMIN_ID` | No | Numeric Telegram user ID that receives aggregate `/stats` instead of personal counts. Send `/id` to obtain your ID. |
 | `PILL_LOG_TIMING` | No | Set to `1` to log Telegram API and update-processing timings. |
 
-The bot logs user identities and activity, but not medication names or dose
-times. Activity events are linked to Telegram user IDs in the database to
-produce personal reports, and are retained for approximately 90 days. System
-logs and backups have separate retention. Protect the database, logs, and
-administrator's Telegram account. The bot does not retain a medication-specific
-history of taken doses.
+The bot logs each user's Telegram username or first name and ID with actions
+such as opening the menu, setting a time zone, viewing medications or pending
+doses, and adding, changing, pausing, or removing a medication. Logs never
+include medication names or times. Reminder deliveries and doses marked taken
+are not logged with a user's name or ID, but failed deliveries (logged with a
+dose number) and the optional `PILL_LOG_TIMING` lines are timestamped, so on a
+bot with very few users they can still hint at schedules.
+
+To produce `/stats` reports, the database's `activity_events` table records
+every action, including each reminder sent and each dose marked taken, with
+the user's Telegram ID and the time it happened. These rows do not name the
+medication, but together they show when each user was reminded and when they
+pressed **Taken**. Rows older than approximately 90 days are deleted daily.
+Each pending dose, with its scheduled time and owner, stays in the database
+until **Taken** is pressed or the medication is removed, so untaken doses
+accumulate. The database also stores each user's latest username or first
+name with their Telegram ID; nothing currently deletes these. System logs and
+backups have separate retention. Protect the database, logs, and
+administrator's Telegram account.
 
 ## Privacy and encryption
 

@@ -213,7 +213,7 @@ class ReminderMixin:
                 next_alert = now + 60
             else:
                 next_alert = int(time.time()) + 3600
-                self.log_activity(dose["user_id"], "was sent a medication reminder")
+                self.log_activity(dose["user_id"], "was sent a medication reminder", private=True)
             with self.db:
                 self.db.execute("UPDATE doses SET next_alert = ? WHERE id = ?",
                                 (next_alert, dose["id"]))
