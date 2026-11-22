@@ -4,7 +4,7 @@ import json
 import re
 import secrets
 
-from .common import HELP, buttons, parse_clock, parse_id, parse_name, parse_times
+from .common import FORGET_CONFIRM_SECONDS, HELP, buttons, parse_clock, parse_id, parse_name, parse_times
 
 
 class MenuMixin:
@@ -110,7 +110,25 @@ class MenuMixin:
             [("My medications", "menu:list:0")],
             [("Pending doses", "menu:pending"), ("Time zone", "menu:timezone")],
             [("Stats", "menu:stats")],
+            [("Delete my data", "menu:forget")],
         ), chat_id=user_id)
+
+    def show_forget_confirmation(self, user_id, data):
+        self.present("Delete all your data? This removes your medications, schedules, "
+                     "pending doses, time zone, name and activity history from the bot. "
+                     "It cannot be undone. Messages already in this chat are not removed.",
+                     buttons([("Yes, delete everything", f"menu:forget:{data['token']}")],
+                             [("Cancel", "menu:home")]), chat_id=user_id)
+
+    def confirm_forget(self, user_id, now):
+        data = {"created": now}
+        self.set_flow(user_id, "forget", data)
+        self.show_forget_confirmation(user_id, data)
+
+    def clear_forget_flow(self, user_id):
+        with self.db:
+            self.db.execute("DELETE FROM conversations WHERE user_id = ? AND state = 'forget'",
+                            (user_id,))
 
     def show_medications(self, user_id, page):
         self.log_activity(user_id, "viewed their medications")
@@ -184,6 +202,9 @@ class MenuMixin:
             self.show_time_confirmation(user_id, data)
         elif state == "time_confirm":
             self.show_time_confirmation(user_id, data)
+        elif state == "forget":
+            # A fresh token, so only the newest confirmation button works.
+            self.confirm_forget(user_id, now)
 
     def show_time_confirmation(self, user_id, data):
         if data["mode"] == "edit":
@@ -242,6 +263,21 @@ class MenuMixin:
             self.clear_flow(user_id)
             self.present(self.usage_report_for(user_id, now),
                          buttons([("Main menu", "menu:home")]), chat_id=user_id)
+        elif action == "forget":
+            self.confirm_forget(user_id, now)
+        elif re.fullmatch(r"forget:[0-9a-f]{8}", action):
+            state, data = self.flow(user_id)
+            if state != "forget" or data.get("token") != action[7:]:
+                self.clear_forget_flow(user_id)
+                self.menu(user_id, "That step is no longer active.")
+                return
+            if not 0 <= now - data.get("created", -FORGET_CONFIRM_SECONDS - 1) <= FORGET_CONFIRM_SECONDS:
+                self.clear_flow(user_id)
+                self.menu(user_id, "That deletion request has expired. Send /forget to start again.")
+                return
+            self.forget(user_id)
+            self.present("All your data has been deleted. If you message the bot again, "
+                         "it will start fresh as for a new user.", chat_id=user_id)
         elif action.startswith("list:"):
             self.clear_flow(user_id)
             page = parse_id(action[5:]) if action[5:] != "0" else 0

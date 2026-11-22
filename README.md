@@ -27,6 +27,9 @@ service.** Delivery depends on the bot, network, Telegram, and your device.
   activity counts for the last 90 days. The configured admin sees aggregate
   counts and the number of distinct users with recorded activity in that period.
   Reports contain no user names, IDs, or medication names.
+- Use **Delete my data** on the main menu or `/forget` to delete everything the
+  bot stores about you, after a confirmation. Messaging the bot again
+  afterwards stores your details again as for a new user.
 
 | Main menu | Medications | Medication settings |
 |---|---|---|
@@ -77,10 +80,26 @@ securely. Do not commit the database, environment files, key, or bot token.
 
 The bot logs user identities and activity, but not medication names or dose
 times. Activity events are linked to Telegram user IDs in the database to
-produce personal reports, and are retained for approximately 90 days. System
-logs and backups have separate retention. Protect the database, logs, and
-administrator's Telegram account. The bot does not retain a medication-specific
-history of taken doses.
+produce personal reports, and are retained for approximately 90 days. The
+stored username or first name of a user with no medications and no activity in
+the last 90 days is also deleted; both checks run at startup and then daily.
+System logs and backups have separate retention. Protect the database, logs,
+and administrator's Telegram account. The bot does not retain a
+medication-specific history of taken doses.
+
+## Deleting your data
+
+`/forget`, or **Delete my data** on the main menu, asks for confirmation and
+then deletes, in one transaction, all of that user's medications, schedules,
+pending doses, unfinished conversation, time zone, stored name and activity
+events. Only the newest confirmation button works, and only for 5 minutes.
+Cancelling, sending any other command, or pressing another button such as
+**Taken** withdraws the request. Typing plain text while it is open shows the
+confirmation again with a new button, and the earlier button stops working.
+An older, expired or withdrawn confirmation does nothing. The bot enables SQLite's `secure_delete`, so
+deleted content is overwritten in the database file. Copies can remain in
+backups, snapshots, system logs, SQLite journal or WAL remnants, storage
+remnants, and the Telegram chat itself, which the bot does not delete.
 
 ## Privacy and encryption
 

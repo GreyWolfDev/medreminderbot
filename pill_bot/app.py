@@ -41,6 +41,8 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
             if authorized:
                 self.remember_identity(callback["from"])
                 action = callback.get("data", "")
+                if not action.startswith("menu:forget"):
+                    self.clear_forget_flow(user)
                 if action.startswith("menu:"):
                     self.api("answerCallbackQuery", callback_query_id=callback["id"])
                     self.clear_reply_prompts(user)
@@ -102,8 +104,15 @@ class ReminderBot(ActivityMixin, TelegramMixin, ReminderMixin, MenuMixin):
             return
         self.remember_identity(message["from"])
         text = message.get("text", "").strip()
+        is_forget = text.split("@", 1)[0].split(" ", 1)[0].lower() == "/forget"
+        if not is_forget and (not text or text.startswith("/")):
+            self.clear_forget_flow(user)
         if text.split("@", 1)[0].split(" ", 1)[0].lower() == "/stats":
             self.send(self.usage_report_for(user, now), chat_id=user)
+            return
+        if is_forget:
+            self.clear_reply_prompts(user)
+            self.confirm_forget(user, now)
             return
         if text.split("@", 1)[0] in ("/start", "/help"):
             self.log_activity(user, "opened the menu")

@@ -50,6 +50,7 @@ class TelegramMixin:
         additions = [
             {"command": "start", "description": "Open the reminder menu"},
             {"command": "stats", "description": "View usage statistics"},
+            {"command": "forget", "description": "Delete all your data"},
         ]
         missing = [item for item in additions if item["command"] not in existing]
         if not missing:
