@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 
 ACTIVITY_RETENTION_SECONDS = 90 * 24 * 60 * 60
+FORGET_CONFIRM_SECONDS = 5 * 60
 
 TIME_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z")
 
@@ -61,7 +62,9 @@ CREATE INDEX IF NOT EXISTS doses_due_alert ON doses(next_alert);
 """
 
 HELP = """Choose an option below. Each scheduled dose is separate and repeats
-hourly until you press Taken. Send /start to return to the menu."""
+hourly until you press Taken. Send /start to return to the menu.
+Send /forget to delete all your data. If you message the bot again
+afterwards, it stores your details again as for a new user."""
 
 TIMEZONE_PROMPT = (
     "Send your IANA time zone, for example Europe/London or America/New_York."
@@ -73,7 +76,7 @@ def buttons(*rows):
         "menu:timezone": "🌍", "menu:stats": "📊", "menu:home": "🏠", "menu:med:": "💊",
         "menu:rename:": "✏️", "menu:times:": "🕒", "menu:toggle:": "⏯️",
         "menu:remove:": "🗑️", "menu:delete:": "🗑️", "menu:drop:": "➖",
-        "menu:save:": "💾", "menu:more:": "➕", "menu:backtimes:": "⬅️",
+        "menu:forget": "🗑️", "menu:save:": "💾", "menu:more:": "➕", "menu:backtimes:": "⬅️",
     }
 
     def button(label, value):

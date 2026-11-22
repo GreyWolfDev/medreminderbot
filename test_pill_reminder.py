@@ -17,6 +17,7 @@ from cryptography.fernet import Fernet
 
 from pill_reminder import (ACTIVITY_RETENTION_SECONDS, ReminderBot, TelegramError,
                            TelegramResponseError, connect, occurrence, parse_clock, parse_times)
+from pill_bot.common import FORGET_CONFIRM_SECONDS
 from pill_bot.privacy import EncryptionError
 
 
@@ -904,6 +905,7 @@ class ReminderTests(unittest.TestCase):
                 {"command": "help", "description": "Help"},
                 {"command": "start", "description": "Open the reminder menu"},
                 {"command": "stats", "description": "View usage statistics"},
+                {"command": "forget", "description": "Delete all your data"},
             ]}),
         ])
 
@@ -912,6 +914,7 @@ class ReminderTests(unittest.TestCase):
         self.bot.api = lambda method, **kw: calls.append(method) or [
             {"command": "start", "description": "Existing description"},
             {"command": "stats", "description": "Existing stats"},
+            {"command": "forget", "description": "Existing forget"},
         ]
         self.bot.register_commands()
         self.assertEqual(calls, ["getMyCommands"])
@@ -934,6 +937,7 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(calls[-1], ("setMyCommands", {"commands": [
             {"command": "start", "description": "Existing description"},
             {"command": "stats", "description": "View usage statistics"},
+            {"command": "forget", "description": "Delete all your data"},
         ]}))
 
     def test_run_registers_at_start_and_survives_registration_failure(self):
@@ -1174,6 +1178,239 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("Pill", self.sent[0][0][0])
         self.assertEqual(calls[-1][0], "editMessageText")
         self.assertEqual(calls[-1][1]["message_id"], 101)
+
+    def forget_update(self, data=None, user=42, text=None, message_id=300, now=None):
+        now = stamp(2026, 1, 1, 9) if now is None else now
+        if text is not None:
+            self.bot.process_update({"message": {
+                "chat": {"id": user, "type": "private"},
+                "from": {"id": user, "username": f"user{user}"}, "text": text,
+            }}, now)
+            return
+        self.bot.process_update({"callback_query": {
+            "id": "click", "from": {"id": user, "username": f"user{user}"}, "data": data,
+            "message": {"message_id": message_id, "chat": {"id": user, "type": "private"}},
+        }}, now)
+
+    def user_rows(self, user):
+        counts = {}
+        for table in [row[0] for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")]:
+            columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            if "user_id" in columns:
+                counts[table] = self.db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE user_id = ?", (user,)).fetchone()[0]
+            elif "reminder_id" in columns:
+                counts[table] = self.db.execute(
+                    f"""SELECT COUNT(*) FROM {table} WHERE reminder_id IN
+                        (SELECT id FROM reminders WHERE user_id = ?)""", (user,)).fetchone()[0]
+        return counts
+
+    def populate_for_forget(self):
+        now = stamp(2026, 1, 1, 7)
+        for user in (42, 99):
+            self.bot.remember_identity({"id": user, "username": f"user{user}"})
+            self.bot.add(user, f"Pill {user}", ["08:00", "20:00"], now)
+        self.bot.create_due(stamp(2026, 1, 1, 8))
+        self.bot.set_flow(99, "add_name", {})
+        with self.db:
+            self.db.execute("INSERT INTO reply_prompts VALUES (99, 500)")
+            self.db.execute("INSERT INTO settings VALUES ('owner', '42')")
+            self.db.execute("INSERT INTO settings VALUES ('timezone', 'Europe/London')")
+
+    def test_forget_requires_confirmation_and_cancel_deletes_nothing(self):
+        self.populate_for_forget()
+        self.bot.api = lambda method, **kw: True
+        self.forget_update(text="/start")
+        self.assertIn("menu:forget", str(self.sent[-1][0][1]))
+        before = self.user_rows(42)
+        self.assertTrue(all(before[table] for table in
+                            ("users", "user_identities", "reminders", "schedules", "doses",
+                             "activity_events")))
+        self.forget_update(text="/forget")
+        text, markup = self.sent[-1][0]
+        self.assertIn("Delete all your data?", text)
+        buttons = [button for row in markup["inline_keyboard"] for button in row]
+        token = self.bot.flow(42)[1]["token"]
+        self.assertEqual([button["callback_data"] for button in buttons],
+                         [f"menu:forget:{token}", "menu:home"])
+        self.assertIn("Yes, delete everything", buttons[0]["text"])
+        self.assertIn("Cancel", buttons[1]["text"])
+        self.assertTrue(all(len(button["callback_data"].encode()) <= 64 for button in buttons))
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.forget_update("menu:home")
+        self.assertIsNone(self.bot.flow(42)[0])
+        self.forget_update(f"menu:forget:{token}")
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.assertEqual(self.user_rows(42)["doses"], before["doses"])
+        self.assertEqual(self.db.execute(
+            "SELECT value FROM settings WHERE key = 'owner'").fetchone()[0], "42")
+        self.bot.forget(99)
+        self.assertEqual(self.db.execute(
+            "SELECT COUNT(*) FROM settings WHERE key IN ('owner', 'timezone')").fetchone()[0], 2)
+
+    def test_forget_deletes_every_user_row_and_keeps_other_users(self):
+        self.populate_for_forget()
+        other_before = self.user_rows(99)
+        other_flow = self.bot.flow(99)
+        calls = []
+        self.bot.api = lambda method, **kw: calls.append((method, kw)) or True
+        self.forget_update("menu:forget")
+        token = self.bot.flow(42)[1]["token"]
+        self.assertEqual(self.bot.flow(42)[0], "forget")
+        with self.db:
+            self.db.execute("INSERT INTO reply_prompts VALUES (42, 501)")
+        # A prompt Telegram fails to delete must still be removed from the database.
+        self.bot.api = lambda method, **kw: (calls.append((method, kw))
+                                             or method != "deleteMessage")
+        with self.assertLogs("pill_reminder", level="INFO") as logs:
+            self.forget_update(f"menu:forget:{token}")
+        self.assertIn("deleted all their data", "\n".join(logs.output))
+        self.assertNotIn("user42", "\n".join(logs.output))
+        self.assertEqual(set(self.user_rows(42).values()), {0})
+        self.assertIn("reply_prompts", self.user_rows(42))
+        self.assertIsNone(self.db.execute(
+            "SELECT 1 FROM settings WHERE key IN ('owner', 'timezone')").fetchone())
+        self.assertEqual(self.user_rows(99), other_before)
+        self.assertEqual(self.bot.flow(99), other_flow)
+        self.assertIn("Pill 99", self.bot.command(99, "/list", 0))
+        self.assertEqual(calls[-1][0], "editMessageText")
+        self.assertIn("All your data has been deleted", calls[-1][1]["text"])
+        self.assertEqual(calls[-1][1]["reply_markup"], {"inline_keyboard": []})
+        self.assertIsNotNone(self.db.execute(
+            "SELECT 1 FROM settings WHERE key = 'bot_id'").fetchone())
+        self.forget_update(text="/start")
+        self.assertEqual(self.user_rows(42)["user_identities"], 1)
+
+    def test_forget_rejects_stale_and_other_users_confirmation(self):
+        self.populate_for_forget()
+        self.bot.api = lambda method, **kw: True
+        self.forget_update(text="/forget")
+        first = self.bot.flow(42)[1]["token"]
+        self.forget_update(text="/FORGET@SomeBot")
+        second = self.bot.flow(42)[1]["token"]
+        self.assertNotEqual(first, second)
+        self.forget_update(f"menu:forget:{first}", message_id=None)
+        self.assertIn("no longer active", self.sent[-1][0][0])
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.forget_update(f"menu:forget:{second}", user=99, message_id=None)
+        self.assertIn("no longer active", self.sent[-1][0][0])
+        self.assertEqual(self.user_rows(99)["reminders"], 1)
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.forget_update(text="/forget")
+        second = self.bot.flow(42)[1]["token"]
+        self.forget_update(text="not a command")
+        self.assertIn("Delete all your data?", self.sent[-1][0][0])
+        reshown = self.bot.flow(42)[1]["token"]
+        self.assertNotEqual(reshown, second)
+        self.assertIn(f"menu:forget:{reshown}", str(self.sent[-1][0][1]))
+        self.forget_update(f"menu:forget:{second}", message_id=None)
+        self.assertIn("no longer active", self.sent[-1][0][0])
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.forget_update(text="/forget")
+        second = self.bot.flow(42)[1]["token"]
+        self.bot.menu_action(42, "add", stamp(2026, 1, 1, 9))
+        self.bot.menu_action(42, f"forget:{second}", stamp(2026, 1, 1, 9))
+        self.assertIn("no longer active", self.sent[-1][0][0])
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.bot.menu_action(42, "forget", stamp(2026, 1, 1, 9))
+        third = self.bot.flow(42)[1]["token"]
+        self.bot.menu_action(42, f"forget:{third}", stamp(2026, 1, 1, 9))
+        self.assertEqual(self.user_rows(42)["reminders"], 0)
+        self.bot.menu_action(42, f"forget:{third}", stamp(2026, 1, 1, 9))
+        self.assertIn("no longer active", self.sent[-1][0][0])
+        self.assertEqual(self.user_rows(99)["reminders"], 1)
+
+    def test_forget_confirmation_expires(self):
+        self.populate_for_forget()
+        self.bot.api = lambda method, **kw: True
+        start = stamp(2026, 1, 1, 9)
+        before = self.user_rows(42)
+        self.forget_update(text="/forget", now=start)
+        token = self.bot.flow(42)[1]["token"]
+        self.forget_update(f"menu:forget:{token}", message_id=None,
+                           now=start + FORGET_CONFIRM_SECONDS + 1)
+        self.assertIn("expired", self.sent[-1][0][0])
+        self.assertIn("/forget", self.sent[-1][0][0])
+        self.assertIsNone(self.bot.flow(42)[0])
+        self.assertEqual(self.user_rows(42)["reminders"], 1)
+        self.assertEqual(self.user_rows(42)["doses"], before["doses"])
+        self.forget_update(text="/forget", now=start)
+        token = self.bot.flow(42)[1]["token"]
+        self.forget_update(f"menu:forget:{token}", now=start + FORGET_CONFIRM_SECONDS)
+        self.assertEqual(set(self.user_rows(42).values()), {0})
+
+    def test_forget_confirmation_withdrawn_by_command_or_taken(self):
+        self.populate_for_forget()
+        self.bot.api = lambda method, **kw: True
+        before = self.user_rows(42)
+        steps = (("/list", 1), ("/id", 1), ("/add Another | 09:00", 2), ("/stats", 2),
+                 ("", 2), ("taken", 2))
+        for intervening, reminders in steps:
+            with self.subTest(intervening=intervening):
+                self.forget_update(text="/forget")
+                token = self.bot.flow(42)[1]["token"]
+                if intervening == "taken":
+                    dose_id = self.db.execute(
+                        """SELECT doses.id FROM doses JOIN reminders
+                           ON reminders.id = doses.reminder_id
+                           WHERE reminders.user_id = 42 ORDER BY doses.id""").fetchone()[0]
+                    self.forget_update(f"taken:{dose_id}")
+                else:
+                    self.forget_update(text=intervening)
+                self.assertIsNone(self.bot.flow(42)[0])
+                self.forget_update(f"menu:forget:{token}", message_id=None)
+                self.assertIn("no longer active", self.sent[-1][0][0])
+                self.assertEqual(self.user_rows(42)["reminders"], reminders)
+                self.assertEqual(self.user_rows(42)["users"], 1)
+                self.assertGreaterEqual(self.user_rows(42)["activity_events"],
+                                        before["activity_events"])
+        self.assertEqual(self.user_rows(42)["doses"], before["doses"] - 1)
+        self.assertEqual(self.bot.flow(99)[0], "add_name")
+
+    def test_forget_overwrites_deleted_rows_on_disk(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "forget.sqlite3"
+            db = connect(str(path))
+            bot = ReminderBot("123:token", db)
+            try:
+                bot.bind_database()
+                self.assertEqual(db.execute("PRAGMA secure_delete").fetchone()[0], 1)
+                bot.remember_identity({"id": 42, "first_name": "ForgetMeIdentity"})
+                bot.set_timezone(42, "Pacific/Chatham", 0)
+                self.assertIn(b"ForgetMeIdentity", path.read_bytes())
+                self.assertIn(b"Pacific/Chatham", path.read_bytes())
+                bot.forget(42)
+                for file in Path(directory).iterdir():
+                    content = file.read_bytes()
+                    self.assertNotIn(b"ForgetMeIdentity", content, file.name)
+                    self.assertNotIn(b"Pacific/Chatham", content, file.name)
+            finally:
+                bot.http.close()
+                db.close()
+
+    def test_identity_pruning_respects_retention_window(self):
+        now = 1800000000
+        cutoff = now - ACTIVITY_RETENTION_SECONDS
+        with self.db:
+            self.db.execute("DELETE FROM activity_events")
+        self.bot.add(42, "Pill", ["08:00"], now)
+        with self.db:
+            self.db.execute("DELETE FROM activity_events")
+            self.db.executemany("INSERT INTO user_identities VALUES (?, ?)",
+                                [(user, f"user{user}") for user in (42, 77, 78, 79, 99)])
+            self.db.executemany(
+                "INSERT INTO activity_events (user_id, occurred_at, action) VALUES (?, ?, ?)",
+                [(77, cutoff, "opened the menu"), (78, cutoff - 1, "opened the menu"),
+                 (99, now, "opened the menu")],
+            )
+        self.bot.prune_activity(now)
+        self.assertEqual([row[0] for row in self.db.execute(
+            "SELECT user_id FROM user_identities ORDER BY user_id")], [42, 77, 99])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM users").fetchone()[0], 2)
+        self.bot.prune_activity(now + 1)
+        self.assertEqual([row[0] for row in self.db.execute(
+            "SELECT user_id FROM user_identities ORDER BY user_id")], [42, 99])
 
     def test_clock_input_formats(self):
         for value, expected in (("8 am", "08:00"), ("12:05 AM", "00:05"),

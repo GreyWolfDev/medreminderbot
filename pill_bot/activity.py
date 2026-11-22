@@ -41,10 +41,16 @@ class ActivityMixin:
         LOG.info("User %s (ID %s) %s", identity, user_id, action)
 
     def prune_activity(self, now):
+        cutoff = now - ACTIVITY_RETENTION_SECONDS
         with self.db:
+            self.db.execute("DELETE FROM activity_events WHERE occurred_at < ?", (cutoff,))
             self.db.execute(
-                "DELETE FROM activity_events WHERE occurred_at < ?",
-                (now - ACTIVITY_RETENTION_SECONDS,),
+                """DELETE FROM user_identities WHERE NOT EXISTS
+                   (SELECT 1 FROM reminders WHERE reminders.user_id = user_identities.user_id)
+                   AND NOT EXISTS (SELECT 1 FROM activity_events
+                   WHERE activity_events.user_id = user_identities.user_id
+                   AND occurred_at >= ?)""",
+                (cutoff,),
             )
 
     def usage_report(self, now, *, user_id=None):

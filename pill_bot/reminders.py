@@ -170,6 +170,22 @@ class ReminderMixin:
             self.log_activity(user_id, "removed a medication")
         return bool(removed)
 
+    def forget(self, user_id):
+        with self.db:
+            owned = "reminder_id IN (SELECT id FROM reminders WHERE user_id = ?)"
+            self.db.execute("DELETE FROM doses WHERE " + owned, (user_id,))
+            self.db.execute("DELETE FROM schedules WHERE " + owned, (user_id,))
+            for table in ("reminders", "conversations", "reply_prompts", "users",
+                          "user_identities", "activity_events"):
+                self.db.execute(f"DELETE FROM {table} WHERE user_id = ?", (user_id,))
+            # Left over from migrating a single-owner database.
+            self.db.execute(
+                """DELETE FROM settings WHERE key IN ('owner', 'timezone') AND EXISTS
+                   (SELECT 1 FROM settings WHERE key = 'owner' AND value = ?)""",
+                (str(user_id),),
+            )
+        LOG.info("User ID %s deleted all their data", user_id)
+
     def create_due(self, now):
         with self.db:
             slots = self.db.execute(
